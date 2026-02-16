@@ -1,117 +1,183 @@
+"""
+HTTP client for the volatility_analysis Bridge API.
+Provides both synchronous (BridgeClient) and asynchronous (AsyncBridgeClient) interfaces.
+Targets endpoints on http://<host>:8668.
+"""
+
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, List, Optional
 
-import httpx
+import requests
+
+try:
+    import httpx
+
+    _HTTPX_AVAILABLE = True
+except ImportError:
+    _HTTPX_AVAILABLE = False
 
 from .models import BridgeSnapshot
 
 
-class BridgeClientError(RuntimeError):
-    """Bridge API request or payload error."""
-
-
 class BridgeClient:
-    """
-    HTTP client for volatility_analysis bridge endpoints.
-    """
+    """Synchronous HTTP client for the Bridge API."""
 
     def __init__(
         self,
         base_url: str = "http://localhost:8668",
         timeout: float = 30.0,
-        client: Optional[httpx.Client] = None,
-    ) -> None:
+        headers: Optional[Dict[str, str]] = None,
+    ):
         self.base_url = base_url.rstrip("/")
-        self._owns_client = client is None
-        self.client = client or httpx.Client(base_url=self.base_url, timeout=timeout)
+        self.timeout = timeout
+        self._session = requests.Session()
+        if headers:
+            self._session.headers.update(headers)
 
-    def _ensure_success(self, payload: Any) -> Dict[str, Any]:
-        if not isinstance(payload, dict):
-            raise BridgeClientError(f"Unexpected bridge payload type: {type(payload).__name__}")
-        if payload.get("success") is False:
-            raise BridgeClientError(str(payload.get("error") or "Bridge API returned success=False"))
-        return payload
-
-    def get_bridge_snapshot(
-        self,
-        symbol: str,
-        date: Optional[str] = None,
-        source: Optional[str] = None,
-    ) -> BridgeSnapshot:
-        params: Dict[str, str] = {}
-        if date:
-            params["date"] = date
-        if source:
-            params["source"] = source
-
-        response = self.client.get(f"/api/bridge/params/{symbol.upper()}", params=params)
-        response.raise_for_status()
-        payload = self._ensure_success(response.json())
-
-        bridge_data = payload.get("bridge") or payload.get("data")
-        if not isinstance(bridge_data, dict):
-            raise BridgeClientError("Bridge snapshot payload missing 'bridge' object")
-
-        snapshot = BridgeSnapshot.from_dict(bridge_data)
-        if not snapshot.symbol:
-            snapshot.symbol = symbol.upper()
-        return snapshot
-
-    def get_bridge_batch(
-        self,
-        symbols: Optional[List[str]] = None,
-        date: Optional[str] = None,
-        source: str = "swing",
-        min_direction_score: float = 1.0,
-        min_vol_score: float = 0.8,
-        limit: int = 50,
-    ) -> Dict[str, Any]:
-        body: Dict[str, Any] = {
-            "source": source,
-            "limit": int(limit),
-            "min_direction_score": float(min_direction_score),
-            "min_vol_score": float(min_vol_score),
-        }
-        if date:
-            body["date"] = date
-        if symbols:
-            body["symbols"] = [s.upper() for s in symbols]
-
-        response = self.client.post("/api/bridge/batch", json=body)
-        response.raise_for_status()
-        payload = self._ensure_success(response.json())
-        return payload
-
-    def get_records(self, date: Optional[str] = None) -> List[Dict[str, Any]]:
-        params = {"date": date} if date else None
-        response = self.client.get("/api/records", params=params)
-        response.raise_for_status()
-        payload = response.json()
-        if isinstance(payload, list):
-            return payload
-        if isinstance(payload, dict):
-            records = payload.get("results") or payload.get("data")
-            if isinstance(records, list):
-                return records
-        raise BridgeClientError("Unexpected /api/records response shape")
-
-    def get_config(self) -> Dict[str, Any]:
-        response = self.client.get("/api/config")
-        response.raise_for_status()
-        payload = response.json()
-        if isinstance(payload, dict) and isinstance(payload.get("config"), dict):
-            return payload["config"]
-        if isinstance(payload, dict):
-            return payload
-        raise BridgeClientError("Unexpected /api/config response shape")
-
-    def close(self) -> None:
-        if self._owns_client:
-            self.client.close()
-
+    # --- Context manager ---
     def __enter__(self) -> "BridgeClient":
         return self
 
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+    def __exit__(self, *exc: Any) -> None:
         self.close()
+
+    def close(self) -> None:
+        self._session.close()
+
+    # --- Endpoints ---
+    def get_snapshot(self, symbol: str) -> BridgeSnapshot:
+        """GET /api/bridge/params/<symbol>"""
+        url = f"{self.base_url}/api/bridge/params/{symbol.upper()}"
+        resp = self._session.get(url, timeout=self.timeout)
+        resp.raise_for_status()
+        return BridgeSnapshot.from_dict(resp.json())
+
+    def get_batch(
+        self,
+        symbols: Optional[List[str]] = None,
+        source: Optional[str] = None,
+        filtering: Optional[Dict[str, Any]] = None,
+        sorting: Optional[Dict[str, Any]] = None,
+    ) -> List[BridgeSnapshot]:
+        """POST /api/bridge/batch"""
+        url = f"{self.base_url}/api/bridge/batch"
+        payload: Dict[str, Any] = {}
+        if symbols:
+            payload["symbols"] = [s.upper() for s in symbols]
+        if source:
+            payload["source"] = source
+        if filtering:
+            payload["filtering"] = filtering
+        if sorting:
+            payload["sorting"] = sorting
+        resp = self._session.post(url, json=payload, timeout=self.timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        items = data if isinstance(data, list) else data.get("results", data.get("snapshots", []))
+        return [BridgeSnapshot.from_dict(item) for item in items]
+
+    def get_records(self, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """GET /api/records"""
+        url = f"{self.base_url}/api/records"
+        resp = self._session.get(url, params=params, timeout=self.timeout)
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_config(self) -> Dict[str, Any]:
+        """GET /api/config"""
+        url = f"{self.base_url}/api/config"
+        resp = self._session.get(url, timeout=self.timeout)
+        resp.raise_for_status()
+        return resp.json()
+
+    def update_config(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        """POST /api/config"""
+        url = f"{self.base_url}/api/config"
+        resp = self._session.post(url, json=config, timeout=self.timeout)
+        resp.raise_for_status()
+        return resp.json()
+
+    def analyze(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """POST /api/analyze"""
+        url = f"{self.base_url}/api/analyze"
+        resp = self._session.post(url, json=payload, timeout=self.timeout)
+        resp.raise_for_status()
+        return resp.json()
+
+
+class AsyncBridgeClient:
+    """Asynchronous HTTP client for the Bridge API (requires httpx)."""
+
+    def __init__(
+        self,
+        base_url: str = "http://localhost:8668",
+        timeout: float = 30.0,
+        headers: Optional[Dict[str, str]] = None,
+    ):
+        if not _HTTPX_AVAILABLE:
+            raise ImportError("httpx is required for AsyncBridgeClient: pip install httpx")
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self._client = httpx.AsyncClient(
+            base_url=self.base_url,
+            timeout=timeout,
+            headers=headers or {},
+        )
+
+    async def __aenter__(self) -> "AsyncBridgeClient":
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        await self.close()
+
+    async def close(self) -> None:
+        await self._client.aclose()
+
+    async def get_snapshot(self, symbol: str) -> BridgeSnapshot:
+        resp = await self._client.get(f"/api/bridge/params/{symbol.upper()}")
+        resp.raise_for_status()
+        return BridgeSnapshot.from_dict(resp.json())
+
+    async def get_batch(
+        self,
+        symbols: Optional[List[str]] = None,
+        source: Optional[str] = None,
+        filtering: Optional[Dict[str, Any]] = None,
+        sorting: Optional[Dict[str, Any]] = None,
+    ) -> List[BridgeSnapshot]:
+        payload: Dict[str, Any] = {}
+        if symbols:
+            payload["symbols"] = [s.upper() for s in symbols]
+        if source:
+            payload["source"] = source
+        if filtering:
+            payload["filtering"] = filtering
+        if sorting:
+            payload["sorting"] = sorting
+        resp = await self._client.post("/api/bridge/batch", json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+        items = data if isinstance(data, list) else data.get("results", data.get("snapshots", []))
+        return [BridgeSnapshot.from_dict(item) for item in items]
+
+    async def get_records(self, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        resp = await self._client.get("/api/records", params=params)
+        resp.raise_for_status()
+        return resp.json()
+
+    async def get_config(self) -> Dict[str, Any]:
+        resp = await self._client.get("/api/config")
+        resp.raise_for_status()
+        return resp.json()
+
+    async def update_config(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        resp = await self._client.post("/api/config", json=config)
+        resp.raise_for_status()
+        return resp.json()
+
+    async def analyze(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        resp = await self._client.post("/api/analyze", json=payload)
+        resp.raise_for_status()
+        return resp.json()

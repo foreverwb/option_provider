@@ -1,124 +1,120 @@
 """
-Unified provider: bridge client + ORATS command sets.
+UnifiedProvider — single entry point that combines bridge_client + orats_provider.
+
+full_analysis() is fault-tolerant: any sub-query failure does not block others.
+Supports context manager protocol.
 """
 
 from __future__ import annotations
 
+import traceback
 from typing import Any, Dict, List, Optional
 
-from bridge_client.client import BridgeClient
-from bridge_client.micro_templates import select_micro_template
-from bridge_client.models import BridgeSnapshot
-from orats_provider.client import OratsClient
-from orats_provider.greeks_exposure.commands import GreeksExposureCommands
-from orats_provider.models import ExposureResult, VolatilityResult
-from orats_provider.volatility.commands import VolatilityCommands
+from bridge_client import BridgeClient, BridgeSnapshot, select_micro_template
+from orats_provider import OratsClient, OratsConfig
+from orats_provider.greeks_exposure import commands as greeks_commands
+from orats_provider.volatility import commands as vol_commands
 
 
 class UnifiedProvider:
-    """
-    One-stop provider for bridge snapshots and ORATS metrics.
-    """
+    """Unified provider integrating Bridge + ORATS data sources."""
 
     def __init__(
         self,
-        va_base_url: str = "http://localhost:8668",
-        orats_token: Optional[str] = None,
-    ) -> None:
-        self.bridge = BridgeClient(base_url=va_base_url)
-        self.orats = OratsClient(token=orats_token)
-        self.greeks = GreeksExposureCommands(self.orats)
-        self.vol = VolatilityCommands(self.orats)
+        bridge_url: str = "http://localhost:8668",
+        orats_config: Optional[OratsConfig] = None,
+        use_cache: bool = True,
+    ):
+        self._bridge = BridgeClient(base_url=bridge_url)
+        self._orats = OratsClient(config=orats_config, use_cache=use_cache)
 
-    # Bridge
-    def get_bridge_snapshot(self, symbol: str, date: Optional[str] = None) -> BridgeSnapshot:
-        return self.bridge.get_bridge_snapshot(symbol, date=date)
-
-    def get_micro_template(
-        self, symbol: str, date: Optional[str] = None, cfg: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
-        snapshot = self.get_bridge_snapshot(symbol, date)
-        return select_micro_template(snapshot, cfg or {})
-
-    def get_bridge_batch(
-        self,
-        symbols: Optional[List[str]] = None,
-        date: Optional[str] = None,
-        source: str = "swing",
-        min_direction_score: float = 1.0,
-        min_vol_score: float = 0.8,
-        limit: int = 50,
-    ) -> Dict[str, Any]:
-        return self.bridge.get_bridge_batch(
-            symbols=symbols,
-            date=date,
-            source=source,
-            min_direction_score=min_direction_score,
-            min_vol_score=min_vol_score,
-            limit=limit,
-        )
-
-    # Greeks
-    def gex(self, symbol: str, **kwargs: Any) -> ExposureResult:
-        return self.greeks.gex(symbol, **kwargs)
-
-    def gexn(self, symbol: str, **kwargs: Any) -> ExposureResult:
-        return self.greeks.gexn(symbol, **kwargs)
-
-    def gexr(self, symbol: str, **kwargs: Any) -> ExposureResult:
-        return self.greeks.gexr(symbol, **kwargs)
-
-    def gexs(self, symbol: str, **kwargs: Any) -> ExposureResult:
-        return self.greeks.gexs(symbol, **kwargs)
-
-    def dex(self, symbol: str, **kwargs: Any) -> ExposureResult:
-        return self.greeks.dex(symbol, **kwargs)
-
-    def dexn(self, symbol: str, **kwargs: Any) -> ExposureResult:
-        return self.greeks.dexn(symbol, **kwargs)
-
-    def vex(self, symbol: str, **kwargs: Any) -> ExposureResult:
-        return self.greeks.vex(symbol, **kwargs)
-
-    def vexn(self, symbol: str, **kwargs: Any) -> ExposureResult:
-        return self.greeks.vexn(symbol, **kwargs)
-
-    def vanna(self, symbol: str, **kwargs: Any) -> ExposureResult:
-        return self.greeks.vanna(symbol, **kwargs)
-
-    # Volatility
-    def skew(self, symbol: str, **kwargs: Any) -> VolatilityResult:
-        return self.vol.skew(symbol, **kwargs)
-
-    def term(self, symbol: str, **kwargs: Any) -> VolatilityResult:
-        return self.vol.term(symbol, **kwargs)
-
-    def surface(self, symbol: str, **kwargs: Any) -> VolatilityResult:
-        return self.vol.surface(symbol, **kwargs)
-
-    # Combined
-    def full_analysis(self, symbol: str, date: Optional[str] = None) -> Dict[str, Any]:
-        snapshot = self.get_bridge_snapshot(symbol, date)
-        gex_result = self.gex(symbol)
-        term_result = self.term(symbol)
-        skew_result = self.skew(symbol)
-
-        return {
-            "symbol": symbol.upper(),
-            "bridge": snapshot.to_dict(),
-            "greeks": {"gex": gex_result.to_dict()},
-            "volatility": {
-                "term": term_result.to_dict(),
-                "skew": skew_result.to_dict(),
-            },
-        }
-
-    def close(self) -> None:
-        self.bridge.close()
-        self.orats.close()
+    # ── Context manager ─────────────────────────────────────────────
 
     def __enter__(self) -> "UnifiedProvider":
         return self
 
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+    def __exit__(self, *exc: Any) -> None:
         self.close()
+
+    def close(self) -> None:
+        self._bridge.close()
+        self._orats.close()
+
+    # ── Bridge delegates ────────────────────────────────────────────
+
+    def get_bridge_snapshot(self, symbol: str) -> BridgeSnapshot:
+        return self._bridge.get_snapshot(symbol)
+
+    def get_bridge_batch(self, symbols: List[str], **kwargs: Any) -> List[BridgeSnapshot]:
+        return self._bridge.get_batch(symbols, **kwargs)
+
+    def get_micro_template(self, symbol: str) -> Dict[str, Any]:
+        snap = self._bridge.get_snapshot(symbol)
+        template = select_micro_template(snap)
+        return {"symbol": symbol, "micro_template": template, "snapshot": snap.to_dict()}
+
+    # ── Greeks delegates ────────────────────────────────────────────
+
+    def greeks(self, symbol: str, command: str, **kwargs: Any) -> Dict[str, Any]:
+        result = greeks_commands.execute(self._orats, symbol, command, **kwargs)
+        return result.to_dict()
+
+    # ── Volatility delegates ────────────────────────────────────────
+
+    def volatility(self, symbol: str, command: str, **kwargs: Any) -> Dict[str, Any]:
+        result = vol_commands.execute(self._orats, symbol, command, **kwargs)
+        return result.to_dict()
+
+    # ── Full analysis (fault-tolerant) ──────────────────────────────
+
+    def full_analysis(
+        self,
+        symbol: str,
+        greeks_commands_list: Optional[List[str]] = None,
+        vol_commands_list: Optional[List[str]] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """
+        Run a comprehensive analysis for a symbol.
+        Each sub-query is independently wrapped — a failure in one
+        does not block the others.
+        """
+        if greeks_commands_list is None:
+            greeks_commands_list = ["gex", "dex", "vex", "vanna"]
+        if vol_commands_list is None:
+            vol_commands_list = ["skew", "term", "surface"]
+
+        result: Dict[str, Any] = {
+            "symbol": symbol,
+            "bridge": None,
+            "micro_template": None,
+            "greeks": {},
+            "volatility": {},
+            "errors": [],
+        }
+
+        # Bridge snapshot
+        try:
+            snap = self._bridge.get_snapshot(symbol)
+            result["bridge"] = snap.to_dict()
+            result["micro_template"] = select_micro_template(snap)
+        except Exception as e:
+            result["errors"].append({"source": "bridge", "error": str(e)})
+
+        # Greeks
+        for cmd in greeks_commands_list:
+            try:
+                r = greeks_commands.execute(self._orats, symbol, cmd, **kwargs)
+                result["greeks"][cmd] = r.to_dict()
+            except Exception as e:
+                result["errors"].append({"source": f"greeks.{cmd}", "error": str(e)})
+
+        # Volatility
+        for cmd in vol_commands_list:
+            try:
+                r = vol_commands.execute(self._orats, symbol, cmd, **kwargs)
+                result["volatility"][cmd] = r.to_dict()
+            except Exception as e:
+                result["errors"].append({"source": f"volatility.{cmd}", "error": str(e)})
+
+        return result

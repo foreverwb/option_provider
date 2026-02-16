@@ -1,286 +1,213 @@
+"""
+ORATS API client — synchronous and asynchronous variants.
+Covers 6 endpoints: strikes, summaries, cores, monies/implied, ivrank, strikes/options.
+Built-in sliding-window rate limiter + optional TTL cache.
+"""
+
 from __future__ import annotations
 
-import asyncio
-import csv
-import io
 import time
+import threading
 from typing import Any, Dict, List, Optional
 
-import httpx
+import requests
 
+try:
+    import httpx
+    _HTTPX = True
+except ImportError:
+    _HTTPX = False
+
+from .config import OratsConfig, ORATS_BASE_URL
 from .cache import TTLCache
-from .config import CACHE_TTL_SECONDS, ORATS_BASE_URL, ORATS_TOKEN
+from .models import (
+    StrikeRecord, SummaryRecord, CoreRecord, MoniesRecord,
+    IVRankRecord, OptionRecord,
+)
 
 
-class OratsClientError(RuntimeError):
-    """ORATS client request/payload error."""
+# ── Rate limiter ────────────────────────────────────────────────────────
 
+class _SlidingWindowLimiter:
+    """Thread-safe sliding-window rate limiter."""
+
+    def __init__(self, max_requests: int, window_sec: float):
+        self._max = max_requests
+        self._window = window_sec
+        self._timestamps: List[float] = []
+        self._lock = threading.Lock()
+
+    def acquire(self) -> None:
+        while True:
+            with self._lock:
+                now = time.time()
+                cutoff = now - self._window
+                self._timestamps = [t for t in self._timestamps if t > cutoff]
+                if len(self._timestamps) < self._max:
+                    self._timestamps.append(now)
+                    return
+                # Calculate wait time
+                wait = self._timestamps[0] + self._window - now
+            time.sleep(max(0.01, wait))
+
+
+# ── Synchronous client ──────────────────────────────────────────────────
 
 class OratsClient:
-    """
-    ORATS Delayed Data API sync client.
-    """
+    """Synchronous ORATS API client."""
 
-    def __init__(
-        self,
-        token: Optional[str] = None,
-        base_url: str = ORATS_BASE_URL,
-        rate_limit: int = 60,
-        timeout: float = 30.0,
-        cache: Optional[TTLCache] = None,
-        client: Optional[httpx.Client] = None,
-    ) -> None:
-        self.token = token if token is not None else ORATS_TOKEN
-        self.base_url = base_url.rstrip("/")
-        self.rate_limit = int(rate_limit)
-        self._request_times: List[float] = []
-        self.cache = cache or TTLCache(CACHE_TTL_SECONDS)
-        self._owns_client = client is None
-        self.client = client or httpx.Client(base_url=self.base_url, timeout=timeout)
-
-    def _throttle(self) -> None:
-        now = time.monotonic()
-        self._request_times = [t for t in self._request_times if now - t < 60.0]
-        if len(self._request_times) >= self.rate_limit and self._request_times:
-            sleep_time = 60.0 - (now - self._request_times[0])
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-        self._request_times.append(time.monotonic())
-
-    @staticmethod
-    def _cache_key(endpoint: str, params: Dict[str, Any]) -> str:
-        items = sorted((str(k), str(v)) for k, v in params.items())
-        joined = "&".join(f"{k}={v}" for k, v in items)
-        return f"{endpoint}?{joined}"
-
-    @staticmethod
-    def _parse_response(resp: httpx.Response) -> Dict[str, Any]:
-        content_type = resp.headers.get("content-type", "").lower()
-        if "application/json" in content_type or not content_type:
-            payload = resp.json()
-            if isinstance(payload, dict):
-                return payload
-            if isinstance(payload, list):
-                return {"data": payload}
-            raise OratsClientError("Unexpected ORATS JSON response type")
-
-        if "text/csv" in content_type or "application/csv" in content_type:
-            decoded = resp.text
-            reader = csv.DictReader(io.StringIO(decoded))
-            return {"data": list(reader)}
-
-        raise OratsClientError(f"Unsupported ORATS content type: {content_type}")
-
-    def _get(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        self._throttle()
-
-        params = dict(params or {})
-        if self.token:
-            params["token"] = self.token
-
-        key = self._cache_key(endpoint, params)
-        cached = self.cache.get(key)
-        if cached is not None:
-            return cached
-
-        resp = self.client.get(endpoint, params=params)
-        resp.raise_for_status()
-        payload = self._parse_response(resp)
-        self.cache.set(key, payload)
-        return payload
-
-    def get_strikes(
-        self,
-        ticker: str,
-        dte: Optional[str] = None,
-        delta: Optional[str] = None,
-        fields: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
-        params: Dict[str, Any] = {"ticker": ticker}
-        if dte:
-            params["dte"] = dte
-        if delta:
-            params["delta"] = delta
-        if fields:
-            params["fields"] = fields
-        data = self._get("/datav2/strikes", params)
-        return data.get("data", [])
-
-    def get_strikes_options(self, tickers: str) -> List[Dict[str, Any]]:
-        data = self._get("/datav2/strikes/options", {"tickers": tickers})
-        return data.get("data", [])
-
-    def get_summaries(self, ticker: str, fields: Optional[str] = None) -> List[Dict[str, Any]]:
-        params: Dict[str, Any] = {"ticker": ticker}
-        if fields:
-            params["fields"] = fields
-        data = self._get("/datav2/summaries", params)
-        return data.get("data", [])
-
-    def get_cores(self, ticker: str, fields: Optional[str] = None) -> List[Dict[str, Any]]:
-        params: Dict[str, Any] = {"ticker": ticker}
-        if fields:
-            params["fields"] = fields
-        data = self._get("/datav2/cores", params)
-        return data.get("data", [])
-
-    def get_monies_implied(self, ticker: str, fields: Optional[str] = None) -> List[Dict[str, Any]]:
-        params: Dict[str, Any] = {"ticker": ticker}
-        if fields:
-            params["fields"] = fields
-        data = self._get("/datav2/monies/implied", params)
-        return data.get("data", [])
-
-    def get_monies_forecast(self, ticker: str, fields: Optional[str] = None) -> List[Dict[str, Any]]:
-        params: Dict[str, Any] = {"ticker": ticker}
-        if fields:
-            params["fields"] = fields
-        data = self._get("/datav2/monies/forecast", params)
-        return data.get("data", [])
-
-    def get_iv_rank(self, ticker: str) -> List[Dict[str, Any]]:
-        data = self._get("/datav2/ivrank", {"ticker": ticker})
-        return data.get("data", [])
-
-    def close(self) -> None:
-        if self._owns_client:
-            self.client.close()
+    def __init__(self, config: Optional[OratsConfig] = None, use_cache: bool = True):
+        self.config = config or OratsConfig.from_env()
+        self._session = requests.Session()
+        self._limiter = _SlidingWindowLimiter(
+            self.config.rate_limit, self.config.rate_window_sec,
+        )
+        self._cache: Optional[TTLCache] = TTLCache(self.config.cache_ttl) if use_cache else None
 
     def __enter__(self) -> "OratsClient":
         return self
 
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+    def __exit__(self, *exc: Any) -> None:
         self.close()
 
+    def close(self) -> None:
+        self._session.close()
+
+    # ── Raw request ─────────────────────────────────────────────────
+
+    def _get(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        cache_key = None
+        if self._cache and params:
+            cache_key = self._cache.make_key(endpoint, str(sorted(params.items())))
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                return cached
+
+        self._limiter.acquire()
+        url = f"{self.config.base_url}/{endpoint}"
+        p = dict(params or {})
+        p["token"] = self.config.token
+        resp = self._session.get(url, params=p, timeout=30)
+        resp.raise_for_status()
+        data = resp.json().get("data", [])
+
+        if self._cache and cache_key:
+            self._cache.set(cache_key, data)
+        return data
+
+    # ── Typed endpoints ─────────────────────────────────────────────
+
+    def get_strikes(self, symbol: str, **kwargs: Any) -> List[StrikeRecord]:
+        """GET /strikes — full option chain with greeks."""
+        params: Dict[str, Any] = {"ticker": symbol.upper()}
+        params.update(kwargs)
+        return [StrikeRecord.from_orats(r) for r in self._get("strikes", params)]
+
+    def get_summaries(self, symbol: str, **kwargs: Any) -> List[SummaryRecord]:
+        """GET /summaries — vol surface summary."""
+        params: Dict[str, Any] = {"ticker": symbol.upper()}
+        params.update(kwargs)
+        return [SummaryRecord.from_orats(r) for r in self._get("summaries", params)]
+
+    def get_cores(self, symbol: str, **kwargs: Any) -> List[CoreRecord]:
+        """GET /cores — core vol data."""
+        params: Dict[str, Any] = {"ticker": symbol.upper()}
+        params.update(kwargs)
+        return [CoreRecord.from_orats(r) for r in self._get("cores", params)]
+
+    def get_monies_implied(self, symbol: str, **kwargs: Any) -> List[MoniesRecord]:
+        """GET /monies/implied — ATM implied vol by expiry."""
+        params: Dict[str, Any] = {"ticker": symbol.upper()}
+        params.update(kwargs)
+        return [MoniesRecord.from_orats(r) for r in self._get("monies/implied", params)]
+
+    def get_ivrank(self, symbol: str, **kwargs: Any) -> List[IVRankRecord]:
+        """GET /ivrank — IV rank and percentile."""
+        params: Dict[str, Any] = {"ticker": symbol.upper()}
+        params.update(kwargs)
+        return [IVRankRecord.from_orats(r) for r in self._get("ivrank", params)]
+
+    def get_options(self, symbol: str, **kwargs: Any) -> List[StrikeRecord]:
+        """GET /strikes (alias for get_strikes for options data)."""
+        return self.get_strikes(symbol, **kwargs)
+
+    def clear_cache(self) -> None:
+        if self._cache:
+            self._cache.clear()
+
+
+# ── Asynchronous client ─────────────────────────────────────────────────
 
 class AsyncOratsClient:
-    """
-    ORATS Delayed Data API async client.
-    """
+    """Asynchronous ORATS API client (requires httpx)."""
 
-    def __init__(
-        self,
-        token: Optional[str] = None,
-        base_url: str = ORATS_BASE_URL,
-        rate_limit: int = 60,
-        timeout: float = 30.0,
-        cache: Optional[TTLCache] = None,
-        client: Optional[httpx.AsyncClient] = None,
-    ) -> None:
-        self.token = token if token is not None else ORATS_TOKEN
-        self.base_url = base_url.rstrip("/")
-        self.rate_limit = int(rate_limit)
-        self._request_times: List[float] = []
-        self.cache = cache or TTLCache(CACHE_TTL_SECONDS)
-        self._owns_client = client is None
-        self.client = client or httpx.AsyncClient(base_url=self.base_url, timeout=timeout)
-
-    async def _throttle(self) -> None:
-        now = time.monotonic()
-        self._request_times = [t for t in self._request_times if now - t < 60.0]
-        if len(self._request_times) >= self.rate_limit and self._request_times:
-            sleep_time = 60.0 - (now - self._request_times[0])
-            if sleep_time > 0:
-                await asyncio.sleep(sleep_time)
-        self._request_times.append(time.monotonic())
-
-    @staticmethod
-    def _cache_key(endpoint: str, params: Dict[str, Any]) -> str:
-        items = sorted((str(k), str(v)) for k, v in params.items())
-        joined = "&".join(f"{k}={v}" for k, v in items)
-        return f"{endpoint}?{joined}"
-
-    @staticmethod
-    def _parse_response(resp: httpx.Response) -> Dict[str, Any]:
-        content_type = resp.headers.get("content-type", "").lower()
-        if "application/json" in content_type or not content_type:
-            payload = resp.json()
-            if isinstance(payload, dict):
-                return payload
-            if isinstance(payload, list):
-                return {"data": payload}
-            raise OratsClientError("Unexpected ORATS JSON response type")
-
-        if "text/csv" in content_type or "application/csv" in content_type:
-            decoded = resp.text
-            reader = csv.DictReader(io.StringIO(decoded))
-            return {"data": list(reader)}
-
-        raise OratsClientError(f"Unsupported ORATS content type: {content_type}")
-
-    async def _get(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        await self._throttle()
-
-        params = dict(params or {})
-        if self.token:
-            params["token"] = self.token
-
-        key = self._cache_key(endpoint, params)
-        cached = self.cache.get(key)
-        if cached is not None:
-            return cached
-
-        resp = await self.client.get(endpoint, params=params)
-        resp.raise_for_status()
-        payload = self._parse_response(resp)
-        self.cache.set(key, payload)
-        return payload
-
-    async def get_strikes(
-        self,
-        ticker: str,
-        dte: Optional[str] = None,
-        delta: Optional[str] = None,
-        fields: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
-        params: Dict[str, Any] = {"ticker": ticker}
-        if dte:
-            params["dte"] = dte
-        if delta:
-            params["delta"] = delta
-        if fields:
-            params["fields"] = fields
-        data = await self._get("/datav2/strikes", params)
-        return data.get("data", [])
-
-    async def get_summaries(self, ticker: str, fields: Optional[str] = None) -> List[Dict[str, Any]]:
-        params: Dict[str, Any] = {"ticker": ticker}
-        if fields:
-            params["fields"] = fields
-        data = await self._get("/datav2/summaries", params)
-        return data.get("data", [])
-
-    async def get_cores(self, ticker: str, fields: Optional[str] = None) -> List[Dict[str, Any]]:
-        params: Dict[str, Any] = {"ticker": ticker}
-        if fields:
-            params["fields"] = fields
-        data = await self._get("/datav2/cores", params)
-        return data.get("data", [])
-
-    async def get_monies_implied(self, ticker: str, fields: Optional[str] = None) -> List[Dict[str, Any]]:
-        params: Dict[str, Any] = {"ticker": ticker}
-        if fields:
-            params["fields"] = fields
-        data = await self._get("/datav2/monies/implied", params)
-        return data.get("data", [])
-
-    async def get_monies_forecast(self, ticker: str, fields: Optional[str] = None) -> List[Dict[str, Any]]:
-        params: Dict[str, Any] = {"ticker": ticker}
-        if fields:
-            params["fields"] = fields
-        data = await self._get("/datav2/monies/forecast", params)
-        return data.get("data", [])
-
-    async def get_iv_rank(self, ticker: str) -> List[Dict[str, Any]]:
-        data = await self._get("/datav2/ivrank", {"ticker": ticker})
-        return data.get("data", [])
-
-    async def close(self) -> None:
-        if self._owns_client:
-            await self.client.aclose()
+    def __init__(self, config: Optional[OratsConfig] = None, use_cache: bool = True):
+        if not _HTTPX:
+            raise ImportError("httpx is required for AsyncOratsClient")
+        self.config = config or OratsConfig.from_env()
+        self._client = httpx.AsyncClient(timeout=30)
+        self._cache: Optional[TTLCache] = TTLCache(self.config.cache_ttl) if use_cache else None
+        # For async, we use a simple semaphore-based approach
+        import asyncio
+        self._semaphore = asyncio.Semaphore(self.config.rate_limit)
 
     async def __aenter__(self) -> "AsyncOratsClient":
         return self
 
-    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+    async def __aexit__(self, *exc: Any) -> None:
         await self.close()
+
+    async def close(self) -> None:
+        await self._client.aclose()
+
+    async def _get(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        cache_key = None
+        if self._cache and params:
+            cache_key = self._cache.make_key(endpoint, str(sorted(params.items())))
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                return cached
+
+        async with self._semaphore:
+            url = f"{self.config.base_url}/{endpoint}"
+            p = dict(params or {})
+            p["token"] = self.config.token
+            resp = await self._client.get(url, params=p)
+            resp.raise_for_status()
+            data = resp.json().get("data", [])
+
+        if self._cache and cache_key:
+            self._cache.set(cache_key, data)
+        return data
+
+    async def get_strikes(self, symbol: str, **kwargs: Any) -> List[StrikeRecord]:
+        params: Dict[str, Any] = {"ticker": symbol.upper()}
+        params.update(kwargs)
+        return [StrikeRecord.from_orats(r) for r in await self._get("strikes", params)]
+
+    async def get_summaries(self, symbol: str, **kwargs: Any) -> List[SummaryRecord]:
+        params: Dict[str, Any] = {"ticker": symbol.upper()}
+        params.update(kwargs)
+        return [SummaryRecord.from_orats(r) for r in await self._get("summaries", params)]
+
+    async def get_cores(self, symbol: str, **kwargs: Any) -> List[CoreRecord]:
+        params: Dict[str, Any] = {"ticker": symbol.upper()}
+        params.update(kwargs)
+        return [CoreRecord.from_orats(r) for r in await self._get("cores", params)]
+
+    async def get_monies_implied(self, symbol: str, **kwargs: Any) -> List[MoniesRecord]:
+        params: Dict[str, Any] = {"ticker": symbol.upper()}
+        params.update(kwargs)
+        return [MoniesRecord.from_orats(r) for r in await self._get("monies/implied", params)]
+
+    async def get_ivrank(self, symbol: str, **kwargs: Any) -> List[IVRankRecord]:
+        params: Dict[str, Any] = {"ticker": symbol.upper()}
+        params.update(kwargs)
+        return [IVRankRecord.from_orats(r) for r in await self._get("ivrank", params)]
+
+    async def get_options(self, symbol: str, **kwargs: Any) -> List[StrikeRecord]:
+        return await self.get_strikes(symbol, **kwargs)
+
+    def clear_cache(self) -> None:
+        if self._cache:
+            self._cache.clear()

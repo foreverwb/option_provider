@@ -1,153 +1,140 @@
 """
-Volatility command entrypoints.
+Volatility analysis command pipeline — fetch → filter → analyze.
+Three commands: skew, term, surface.
 """
 
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Any, Dict, List, Optional
 
-from ..client import OratsClient
-from ..config import DEFAULT_CONTRACT_FILTER, DEFAULT_METRIC, DEFAULT_VOL_DTE
-from ..models import StrikeRow, VolatilityResult
-from ..utils import (
-    filter_by_dte,
-    filter_by_expiration_type,
-    parse_expiration_filter,
-)
-from .analyzer import analyze_skew, analyze_surface, analyze_term_structure
+from ..models import StrikeRecord, VolatilityResult
+from ..utils import filter_by_dte, filter_by_moneyness
+from . import analyzer
 
 
-class VolatilityCommands:
-    def __init__(self, orats_client: OratsClient):
-        self.orats = orats_client
+COMMANDS = ["skew", "term", "surface"]
 
-    def skew(
-        self,
-        symbol: str,
-        metric: str = DEFAULT_METRIC,
-        contract_filter: str = DEFAULT_CONTRACT_FILTER,
-        dte: int = 98,
-        expiration_filter: str = "*",
-    ) -> VolatilityResult:
-        summaries = self.orats.get_summaries(
-            symbol,
-            fields=(
-                "ticker,tradeDate,skewing,contango,iv30d,iv60d,iv90d,"
-                "dlt25Iv30d,dlt75Iv30d,dlt5Iv30d,dlt95Iv30d"
-            ),
-        )
-        strikes = self.orats.get_strikes(
-            symbol,
-            dte=f"0,{dte}",
-            fields=(
-                "ticker,tradeDate,expirDate,dte,strike,stockPrice,spotPrice,"
-                "callMidIv,putMidIv,callAskIv,putAskIv,smvVol,delta,gamma,vega,rho"
-            ),
-        )
-        if not strikes:
-            raise ValueError(f"No strikes data for {symbol}")
 
-        exp_enum = parse_expiration_filter(expiration_filter)
-        strikes = filter_by_dte(strikes, dte)
-        strikes = filter_by_expiration_type(strikes, exp_enum)
+def _fetch_and_filter(
+    client: Any,
+    symbol: str,
+    dte_min: int = 0,
+    dte_max: int = 90,
+    moneyness: float = 0.20,
+) -> List[StrikeRecord]:
+    records = client.get_strikes(symbol)
+    records = filter_by_dte(records, dte_min, dte_max)
+    records = filter_by_moneyness(records, moneyness)
+    return records
 
-        rows: List[StrikeRow] = [StrikeRow.from_orats(r) for r in strikes]
-        summary = summaries[0] if summaries else {}
-        data = analyze_skew(rows, summary, contract_filter=contract_filter)
-        data["metric"] = metric
 
-        as_of = str(summary.get("tradeDate") or rows[0].trade_date if rows else "")
-        spot = float(rows[0].spot_price or rows[0].stock_price if rows else 0.0)
+def execute(
+    client: Any,
+    symbol: str,
+    command: str,
+    dte_min: int = 0,
+    dte_max: int = 90,
+    moneyness: float = 0.20,
+    **kwargs: Any,
+) -> VolatilityResult:
+    records = _fetch_and_filter(client, symbol, dte_min, dte_max, moneyness)
+    return execute_from_records(command, symbol, records, **kwargs)
 
-        return VolatilityResult(
-            symbol=symbol.upper(),
-            as_of=as_of,
-            metric_name="skew",
-            data=data,
-            spot_price=spot,
-            parameters={
-                "metric": metric,
-                "contract_filter": contract_filter,
-                "dte": dte,
-                "expiration_filter": expiration_filter,
-            },
-        )
 
-    def term(
-        self,
-        symbol: str,
-        dte: int = DEFAULT_VOL_DTE,
-        expiration_filter: str = "*",
-    ) -> VolatilityResult:
-        summaries = self.orats.get_summaries(
-            symbol,
-            fields=(
-                "ticker,tradeDate,iv10d,iv20d,iv30d,iv60d,iv90d,iv6m,iv1y,"
-                "exErnIv30d,exErnIv60d,exErnIv90d,"
-                "fwd30_20,fwd60_30,fwd90_30,fwd90_60,fwd180_90,contango"
-            ),
-        )
-        monies = self.orats.get_monies_implied(
-            symbol,
-            fields="ticker,tradeDate,expirDate,dte,atmiv,slope,calVol",
-        )
+def execute_from_records(
+    command: str,
+    symbol: str,
+    records: List[StrikeRecord],
+    **kwargs: Any,
+) -> VolatilityResult:
+    cmd = command.lower().strip()
 
-        exp_enum = parse_expiration_filter(expiration_filter)
-        monies = [m for m in monies if int(m.get("dte", 0)) <= int(dte)]
-        monies = filter_by_expiration_type(monies, exp_enum)
+    if cmd == "skew":
+        return _cmd_skew(symbol, records, **kwargs)
+    elif cmd == "term":
+        return _cmd_term(symbol, records, **kwargs)
+    elif cmd == "surface":
+        return _cmd_surface(symbol, records)
+    else:
+        raise ValueError(f"Unknown volatility command: {command}. Available: {COMMANDS}")
 
-        summary = summaries[0] if summaries else {}
-        data = analyze_term_structure(summary, monies)
 
-        as_of = str(summary.get("tradeDate") or "")
+# ── Skew command ────────────────────────────────────────────────────────
 
-        return VolatilityResult(
-            symbol=symbol.upper(),
-            as_of=as_of,
-            metric_name="term",
-            data=data,
-            parameters={"dte": dte, "expiration_filter": expiration_filter},
-        )
+def _cmd_skew(
+    symbol: str,
+    records: List[StrikeRecord],
+    expiry_date: Optional[str] = None,
+    **kwargs: Any,
+) -> VolatilityResult:
+    skew_data = analyzer.compute_skew_by_expiry(records)
 
-    def surface(
-        self,
-        symbol: str,
-        metric: str = DEFAULT_METRIC,
-        contract_filter: str = DEFAULT_CONTRACT_FILTER,
-        dte: int = 98,
-        expiration_filter: str = "*",
-    ) -> VolatilityResult:
-        strikes = self.orats.get_strikes(
-            symbol,
-            dte=f"0,{dte}",
-            fields=(
-                "ticker,tradeDate,expirDate,dte,strike,stockPrice,spotPrice,"
-                "callMidIv,putMidIv,callAskIv,putAskIv,smvVol,delta,gamma,vega,rho"
-            ),
-        )
-        if not strikes:
-            raise ValueError(f"No strikes data for {symbol}")
+    smile_data = None
+    if expiry_date:
+        smile_data = analyzer.compute_smile(records, expiry_date)
 
-        exp_enum = parse_expiration_filter(expiration_filter)
-        strikes = filter_by_dte(strikes, dte)
-        strikes = filter_by_expiration_type(strikes, exp_enum)
+    avg_skew = (
+        sum(d["skew"] for d in skew_data) / len(skew_data)
+        if skew_data else 0
+    )
 
-        rows: List[StrikeRow] = [StrikeRow.from_orats(r) for r in strikes]
-        data = analyze_surface(rows, metric=metric, contract_filter=contract_filter)
+    chart = smile_data if smile_data else skew_data
 
-        as_of = rows[0].trade_date if rows else ""
-        spot = float(rows[0].spot_price or rows[0].stock_price if rows else 0.0)
+    return VolatilityResult(
+        symbol=symbol, command="skew",
+        data={"by_expiry": skew_data, "smile": smile_data},
+        summary={"avg_skew": round(avg_skew, 4), "num_expiries": len(skew_data)},
+        chart_data=chart,
+        metadata={"expiry_date": expiry_date},
+    )
 
-        return VolatilityResult(
-            symbol=symbol.upper(),
-            as_of=as_of,
-            metric_name="surface",
-            data=data,
-            spot_price=spot,
-            parameters={
-                "metric": metric,
-                "contract_filter": contract_filter,
-                "dte": dte,
-                "expiration_filter": expiration_filter,
-            },
-        )
+
+# ── Term structure command ──────────────────────────────────────────────
+
+def _cmd_term(
+    symbol: str,
+    records: List[StrikeRecord],
+    target_dte: int = 30,
+    **kwargs: Any,
+) -> VolatilityResult:
+    term_data = analyzer.compute_term_structure_by_expiry(records)
+    contango = analyzer.detect_contango_state(term_data)
+    const_iv = analyzer.compute_constant_maturity_iv(term_data, target_dte)
+
+    return VolatilityResult(
+        symbol=symbol, command="term",
+        data={"by_expiry": term_data, "contango_state": contango},
+        summary={
+            "state": contango["state"],
+            "front_iv": contango.get("front_iv"),
+            "back_iv": contango.get("back_iv"),
+            "ratio": contango.get("ratio"),
+            f"iv_{target_dte}d": const_iv,
+        },
+        chart_data=term_data,
+        metadata={"target_dte": target_dte},
+    )
+
+
+# ── Surface command ─────────────────────────────────────────────────────
+
+def _cmd_surface(
+    symbol: str,
+    records: List[StrikeRecord],
+) -> VolatilityResult:
+    surface = analyzer.compute_vol_surface(records)
+
+    unique_expiries = sorted(set(d["expiry_date"] for d in surface))
+    unique_strikes = sorted(set(d["strike"] for d in surface))
+
+    return VolatilityResult(
+        symbol=symbol, command="surface",
+        data={"surface": surface},
+        summary={
+            "num_points": len(surface),
+            "num_expiries": len(unique_expiries),
+            "num_strikes": len(unique_strikes),
+        },
+        chart_data=surface,
+        metadata={"chart_type": "3d_surface"},
+    )

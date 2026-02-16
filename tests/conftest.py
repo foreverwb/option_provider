@@ -1,177 +1,148 @@
+"""
+Shared pytest fixtures — synthetic option chain data for testing.
+"""
+
 from __future__ import annotations
 
-from typing import Any, Dict, List
-
+import math
 import pytest
+from typing import List
+
+from bridge_client.models import BridgeSnapshot, TermStructureSnapshot
+from orats_provider.models import StrikeRecord, SummaryRecord, MoniesRecord
+
+
+# ── Synthetic strike chain generator ────────────────────────────────────
+
+def make_strike_chain(
+    symbol: str = "AAPL",
+    spot: float = 150.0,
+    num_strikes: int = 21,
+    expiry_dates: List[str] | None = None,
+) -> List[StrikeRecord]:
+    """
+    Generate a realistic synthetic option chain for testing.
+    """
+    if expiry_dates is None:
+        expiry_dates = ["2026-03-20", "2026-04-17", "2026-06-19"]
+
+    records = []
+    strike_step = spot * 0.01  # 1% spacing
+    base_strike = spot - (num_strikes // 2) * strike_step
+
+    for i_exp, exp in enumerate(expiry_dates):
+        dte = (i_exp + 1) * 30
+        for i in range(num_strikes):
+            strike = round(base_strike + i * strike_step, 2)
+            moneyness = (strike - spot) / spot
+            # Synthetic IV with skew
+            base_iv = 0.25 + 0.08 * (i_exp / 3)  # Contango shape
+            skew = max(0, -moneyness * 0.15)
+            call_iv = max(0.05, base_iv + skew * 0.5)
+            put_iv = max(0.05, base_iv + skew)
+
+            # Synthetic greeks
+            d1 = moneyness / (call_iv * math.sqrt(dte / 365)) if call_iv > 0 and dte > 0 else 0
+            call_delta = max(0.01, min(0.99, 0.5 + 0.4 * math.tanh(d1)))
+            put_delta = call_delta - 1.0
+            gamma = max(0.0001, 0.05 * math.exp(-moneyness ** 2 / 0.02))
+            vega = max(0.001, 0.3 * math.exp(-moneyness ** 2 / 0.04))
+            vanna = -moneyness * gamma * 10
+            theta = -0.05 * call_iv * spot / math.sqrt(max(dte, 1))
+
+            # Synthetic OI (higher near ATM)
+            atm_weight = math.exp(-moneyness ** 2 / 0.01)
+            call_oi = int(1000 + 5000 * atm_weight)
+            put_oi = int(800 + 6000 * atm_weight)
+
+            records.append(StrikeRecord(
+                symbol=symbol,
+                trade_date="2026-02-16",
+                expiry_date=exp,
+                dte=dte,
+                strike=strike,
+                spot_price=spot,
+                call_volume=int(100 + 500 * atm_weight),
+                put_volume=int(80 + 400 * atm_weight),
+                call_oi=call_oi,
+                put_oi=put_oi,
+                call_iv=round(call_iv, 4),
+                put_iv=round(put_iv, 4),
+                call_delta=round(call_delta, 4),
+                put_delta=round(put_delta, 4),
+                call_gamma=round(gamma, 6),
+                put_gamma=round(gamma, 6),
+                call_theta=round(theta, 4),
+                put_theta=round(theta * 0.9, 4),
+                call_vega=round(vega, 4),
+                put_vega=round(vega, 4),
+                call_smv_vol=round(call_iv * 1.02, 4),
+                put_smv_vol=round(put_iv * 0.98, 4),
+                residual_rate=0.0,
+                call_vanna=round(vanna, 6),
+                put_vanna=round(-vanna * 0.8, 6),
+            ))
+    return records
+
+
+# ── Fixtures ────────────────────────────────────────────────────────────
+
+@pytest.fixture
+def strike_chain() -> List[StrikeRecord]:
+    return make_strike_chain()
 
 
 @pytest.fixture
-def mock_orats_strikes() -> List[Dict[str, Any]]:
-    return [
-        {
-            "ticker": "AAPL",
-            "tradeDate": "2025-06-01",
-            "expirDate": "2025-06-06",
-            "dte": 5,
-            "strike": 180.0,
-            "stockPrice": 195.0,
-            "spotPrice": 195.0,
-            "callOpenInterest": 12000,
-            "putOpenInterest": 26000,
-            "callMidIv": 0.20,
-            "putMidIv": 0.24,
-            "smvVol": 0.22,
-            "delta": 0.80,
-            "gamma": 0.025,
-            "vega": 0.12,
-            "rho": 0.02,
-        },
-        {
-            "ticker": "AAPL",
-            "tradeDate": "2025-06-01",
-            "expirDate": "2025-06-06",
-            "dte": 5,
-            "strike": 185.0,
-            "stockPrice": 195.0,
-            "spotPrice": 195.0,
-            "callOpenInterest": 14000,
-            "putOpenInterest": 24000,
-            "callMidIv": 0.21,
-            "putMidIv": 0.25,
-            "smvVol": 0.23,
-            "delta": 0.72,
-            "gamma": 0.030,
-            "vega": 0.13,
-            "rho": 0.02,
-        },
-        {
-            "ticker": "AAPL",
-            "tradeDate": "2025-06-01",
-            "expirDate": "2025-06-20",
-            "dte": 19,
-            "strike": 190.0,
-            "stockPrice": 195.0,
-            "spotPrice": 195.0,
-            "callOpenInterest": 18000,
-            "putOpenInterest": 18000,
-            "callMidIv": 0.22,
-            "putMidIv": 0.24,
-            "smvVol": 0.23,
-            "delta": 0.65,
-            "gamma": 0.035,
-            "vega": 0.15,
-            "rho": 0.02,
-        },
-        {
-            "ticker": "AAPL",
-            "tradeDate": "2025-06-01",
-            "expirDate": "2025-06-20",
-            "dte": 19,
-            "strike": 195.0,
-            "stockPrice": 195.0,
-            "spotPrice": 195.0,
-            "callOpenInterest": 20000,
-            "putOpenInterest": 17000,
-            "callMidIv": 0.22,
-            "putMidIv": 0.23,
-            "smvVol": 0.22,
-            "delta": 0.50,
-            "gamma": 0.040,
-            "vega": 0.16,
-            "rho": 0.02,
-        },
-        {
-            "ticker": "AAPL",
-            "tradeDate": "2025-06-01",
-            "expirDate": "2025-07-18",
-            "dte": 47,
-            "strike": 200.0,
-            "stockPrice": 195.0,
-            "spotPrice": 195.0,
-            "callOpenInterest": 23000,
-            "putOpenInterest": 16000,
-            "callMidIv": 0.21,
-            "putMidIv": 0.22,
-            "smvVol": 0.21,
-            "delta": 0.40,
-            "gamma": 0.030,
-            "vega": 0.14,
-            "rho": 0.02,
-        },
-        {
-            "ticker": "AAPL",
-            "tradeDate": "2025-06-01",
-            "expirDate": "2025-07-18",
-            "dte": 47,
-            "strike": 205.0,
-            "stockPrice": 195.0,
-            "spotPrice": 195.0,
-            "callOpenInterest": 25000,
-            "putOpenInterest": 13000,
-            "callMidIv": 0.20,
-            "putMidIv": 0.21,
-            "smvVol": 0.20,
-            "delta": 0.30,
-            "gamma": 0.024,
-            "vega": 0.12,
-            "rho": 0.02,
-        },
-        {
-            "ticker": "AAPL",
-            "tradeDate": "2025-06-01",
-            "expirDate": "2025-09-19",
-            "dte": 110,
-            "strike": 210.0,
-            "stockPrice": 195.0,
-            "spotPrice": 195.0,
-            "callOpenInterest": 22000,
-            "putOpenInterest": 12000,
-            "callMidIv": 0.19,
-            "putMidIv": 0.20,
-            "smvVol": 0.19,
-            "delta": 0.25,
-            "gamma": 0.018,
-            "vega": 0.11,
-            "rho": 0.02,
-        },
-    ]
+def aapl_chain() -> List[StrikeRecord]:
+    return make_strike_chain("AAPL", spot=150.0)
 
 
 @pytest.fixture
-def mock_orats_summaries() -> List[Dict[str, Any]]:
-    return [
-        {
-            "ticker": "AAPL",
-            "tradeDate": "2025-06-01",
-            "skewing": 0.12,
-            "contango": 0.05,
-            "iv10d": 0.20,
-            "iv20d": 0.21,
-            "iv30d": 0.22,
-            "iv60d": 0.24,
-            "iv90d": 0.25,
-            "iv6m": 0.26,
-            "iv1y": 0.27,
-            "dlt5Iv30d": 0.30,
-            "dlt25Iv30d": 0.24,
-            "dlt75Iv30d": 0.20,
-            "dlt95Iv30d": 0.18,
-            "fwd30_20": 0.01,
-            "fwd60_30": 0.02,
-            "fwd90_30": 0.03,
-            "fwd90_60": 0.01,
-            "fwd180_90": 0.02,
-            "exErnIv30d": 0.21,
-            "exErnIv60d": 0.23,
-            "exErnIv90d": 0.24,
-        }
-    ]
+def bridge_snapshot() -> BridgeSnapshot:
+    return BridgeSnapshot(
+        symbol="AAPL",
+        timestamp="2026-02-16T12:00:00Z",
+        spot_price=150.0,
+        prev_close=148.5,
+        change_pct=1.01,
+        iv_current=0.28,
+        iv_percentile=65.0,
+        iv_rank=58.0,
+        hv_20=0.22,
+        hv_60=0.20,
+        iv_hv_spread=0.06,
+        direction_score=35.0,
+        direction_label="BULL",
+        volatility_score=-10.0,
+        volatility_label="NORMAL",
+        composite_score=12.5,
+        term_structure=TermStructureSnapshot(
+            label_code="CONTANGO",
+            horizon_bias="BALANCED",
+            front_iv=0.25,
+            back_iv=0.30,
+            ratio=0.833,
+            adjustment=0.02,
+            contango=True,
+        ),
+        earnings_date="2026-04-25",
+        days_to_earnings=68,
+        earnings_proximity="FAR",
+        recommended_strategy="BULL_CALL_SPREAD",
+        strategy_confidence=0.72,
+        source="bridge_api",
+    )
 
 
 @pytest.fixture
-def mock_orats_monies() -> List[Dict[str, Any]]:
-    return [
-        {"ticker": "AAPL", "tradeDate": "2025-06-01", "expirDate": "2025-06-20", "dte": 19, "atmiv": 0.22, "slope": 0.01, "calVol": 0.21},
-        {"ticker": "AAPL", "tradeDate": "2025-06-01", "expirDate": "2025-07-18", "dte": 47, "atmiv": 0.23, "slope": 0.02, "calVol": 0.22},
-        {"ticker": "AAPL", "tradeDate": "2025-06-01", "expirDate": "2025-09-19", "dte": 110, "atmiv": 0.25, "slope": 0.03, "calVol": 0.24},
-    ]
+def bridge_snapshot_bearish() -> BridgeSnapshot:
+    return BridgeSnapshot(
+        symbol="TSLA",
+        direction_score=-45.0,
+        volatility_score=55.0,
+        term_structure=TermStructureSnapshot(
+            label_code="BACKWARDATION",
+            horizon_bias="FRONT_HEAVY",
+        ),
+        earnings_proximity="IMMINENT",
+    )

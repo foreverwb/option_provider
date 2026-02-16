@@ -1,227 +1,207 @@
 """
-Volatility analytics helpers.
+Volatility analysis functions — skew, term structure, and surface.
+
+Skew:
+  - by-expiry skew (put IV - call IV slope)
+  - smile curve (IV vs strike for a single expiry)
+
+Term Structure:
+  - constant-maturity interpolation
+  - by-expiry ATM IV
+  - contango/backwardation state detection
+
+Surface:
+  - strike × expiry IV matrix
 """
 
 from __future__ import annotations
 
-from collections import defaultdict
-from statistics import mean
-from typing import Any, Dict, List
+import math
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from ..models import ContractFilter, StrikeRow, VolMetric
-from ..utils import is_atm, parse_contract_filter
-
-
-def _spot(rows: List[StrikeRow]) -> float:
-    if not rows:
-        return 0.0
-    return float(rows[0].spot_price or rows[0].stock_price or 0.0)
+from ..models import StrikeRecord, MoniesRecord
+from ..utils import group_by_expiry, filter_atm
 
 
-def _metric_value(row: StrikeRow, metric: str) -> float:
-    normalized = str(metric or VolMetric.VOLATILITY_MID.name).strip().upper()
-    if normalized in {"VOLATILITY_MID", "SMVVOL"}:
-        return float(row.smv_vol)
-    if normalized in {"IV", "IVMID"}:
-        vals = [row.call_mid_iv, row.put_mid_iv]
-        vals = [float(v) for v in vals if v is not None]
-        return mean(vals) if vals else 0.0
-    if normalized in {"IVASK", "IV_ASK"}:
-        vals = [row.call_ask_iv, row.put_ask_iv]
-        vals = [float(v) for v in vals if v is not None]
-        return mean(vals) if vals else 0.0
-    if normalized == "DELTA":
-        return float(row.delta)
-    if normalized == "GAMMA":
-        return float(row.gamma)
-    if normalized == "VEGA":
-        return float(row.vega)
-    if normalized == "RHO":
-        return float(row.rho)
-    return float(row.smv_vol)
+# ── Skew Analysis ───────────────────────────────────────────────────────
+
+def compute_skew_by_expiry(records: Sequence[StrikeRecord]) -> List[Dict[str, Any]]:
+    """
+    Compute skew per expiry as the slope of put IV vs call IV
+    across strikes.  Approximated as:
+    skew = avg(put_iv) - avg(call_iv) for OTM options.
+    """
+    by_exp = group_by_expiry(list(records))
+    results = []
+    for expiry in sorted(by_exp.keys()):
+        strikes = by_exp[expiry]
+        if not strikes:
+            continue
+        spot = strikes[0].spot_price
+        # OTM puts: strike < spot, OTM calls: strike > spot
+        otm_put_ivs = [r.put_iv for r in strikes if r.strike < spot and r.put_iv > 0]
+        otm_call_ivs = [r.call_iv for r in strikes if r.strike > spot and r.call_iv > 0]
+
+        avg_put = sum(otm_put_ivs) / len(otm_put_ivs) if otm_put_ivs else 0
+        avg_call = sum(otm_call_ivs) / len(otm_call_ivs) if otm_call_ivs else 0
+        skew = avg_put - avg_call
+
+        results.append({
+            "expiry_date": expiry,
+            "dte": strikes[0].dte,
+            "avg_put_iv": round(avg_put, 4),
+            "avg_call_iv": round(avg_call, 4),
+            "skew": round(skew, 4),
+            "num_strikes": len(strikes),
+        })
+    return results
 
 
-def _filter_rows_for_contract(rows: List[StrikeRow], contract_filter: str) -> List[StrikeRow]:
-    filt = parse_contract_filter(contract_filter)
-    if filt in {ContractFilter.CALLS, ContractFilter.PUTS}:
-        return rows
-
-    spot = _spot(rows)
-    if spot <= 0:
-        return rows
-
-    if filt == ContractFilter.ATM:
-        return [r for r in rows if is_atm(r.strike, spot)]
-
-    if filt == ContractFilter.NTM:
-        return [r for r in rows if abs(r.strike - spot) / spot <= 0.05]
-
-    if filt == ContractFilter.ITM:
-        return [r for r in rows if abs(r.strike - spot) / spot > 0.02]
-
-    return rows
-
-
-def analyze_skew(
-    rows: List[StrikeRow],
-    summaries: Dict[str, Any] | None = None,
-    contract_filter: str = "ntm",
-) -> Dict[str, Any]:
-    summaries = summaries or {}
-    filtered = _filter_rows_for_contract(rows, contract_filter)
-    grouped: Dict[str, List[StrikeRow]] = defaultdict(list)
-    for row in filtered:
-        grouped[row.expir_date].append(row)
-
-    by_expiry: List[Dict[str, Any]] = []
-    for expiry, items in grouped.items():
-        call_vals = [float(r.call_mid_iv) for r in items]
-        put_vals = [float(r.put_mid_iv) for r in items]
-        call_iv = mean(call_vals) if call_vals else 0.0
-        put_iv = mean(put_vals) if put_vals else 0.0
-        skew_val = put_iv - call_iv
-        by_expiry.append(
-            {
-                "expiry": expiry,
-                "count": len(items),
-                "call_iv": call_iv,
-                "put_iv": put_iv,
-                "skew": skew_val,
-            }
-        )
-
-    by_expiry.sort(key=lambda x: x["expiry"])
-    overall_skew = mean([item["skew"] for item in by_expiry]) if by_expiry else 0.0
-
-    return {
-        "overall_skew": overall_skew,
-        "by_expiry": by_expiry,
-        "summary_skewing": summaries.get("skewing"),
-        "summary_contango": summaries.get("contango"),
-        "summary_iv30d": summaries.get("iv30d"),
-        "summary_iv60d": summaries.get("iv60d"),
-        "summary_iv90d": summaries.get("iv90d"),
-        "summary_delta_wing": {
-            "dlt5Iv30d": summaries.get("dlt5Iv30d"),
-            "dlt25Iv30d": summaries.get("dlt25Iv30d"),
-            "dlt75Iv30d": summaries.get("dlt75Iv30d"),
-            "dlt95Iv30d": summaries.get("dlt95Iv30d"),
-        },
-    }
+def compute_smile(
+    records: Sequence[StrikeRecord],
+    expiry_date: str,
+) -> List[Dict[str, Any]]:
+    """
+    IV smile curve for a single expiry: IV vs strike.
+    Returns midpoint IV = (call_iv + put_iv) / 2 at each strike.
+    """
+    filtered = [r for r in records if r.expiry_date == expiry_date]
+    results = []
+    for r in sorted(filtered, key=lambda x: x.strike):
+        mid_iv = (r.call_iv + r.put_iv) / 2 if (r.call_iv > 0 and r.put_iv > 0) else max(r.call_iv, r.put_iv)
+        moneyness = (r.strike / r.spot_price - 1) if r.spot_price > 0 else 0
+        results.append({
+            "strike": r.strike,
+            "moneyness": round(moneyness, 4),
+            "call_iv": round(r.call_iv, 4),
+            "put_iv": round(r.put_iv, 4),
+            "mid_iv": round(mid_iv, 4),
+        })
+    return results
 
 
-def analyze_term_structure(
-    summaries: Dict[str, Any] | None,
-    monies: List[Dict[str, Any]],
-) -> Dict[str, Any]:
-    summaries = summaries or {}
+# ── Term Structure Analysis ─────────────────────────────────────────────
 
-    constant_curve = {
-        "iv10d": summaries.get("iv10d"),
-        "iv20d": summaries.get("iv20d"),
-        "iv30d": summaries.get("iv30d"),
-        "iv60d": summaries.get("iv60d"),
-        "iv90d": summaries.get("iv90d"),
-        "iv6m": summaries.get("iv6m"),
-        "iv1y": summaries.get("iv1y"),
-        "exErnIv30d": summaries.get("exErnIv30d"),
-        "exErnIv60d": summaries.get("exErnIv60d"),
-        "exErnIv90d": summaries.get("exErnIv90d"),
-    }
-
-    implied_curve = []
-    for row in monies:
-        implied_curve.append(
-            {
-                "expiry": row.get("expirDate"),
-                "dte": row.get("dte"),
-                "atmiv": row.get("atmiv"),
-                "slope": row.get("slope"),
-                "calVol": row.get("calVol"),
-            }
-        )
-    implied_curve.sort(key=lambda x: (x.get("dte") if x.get("dte") is not None else 99999))
-
-    iv30 = _float_or_none(summaries.get("iv30d"))
-    iv60 = _float_or_none(summaries.get("iv60d"))
-    iv90 = _float_or_none(summaries.get("iv90d"))
-    contango_raw = _float_or_none(summaries.get("contango"))
-
-    if contango_raw is not None:
-        state = "contango" if contango_raw > 0 else "backwardation"
-    elif iv30 is not None and iv60 is not None and iv90 is not None:
-        if iv30 <= iv60 <= iv90:
-            state = "contango"
-        elif iv30 >= iv60 >= iv90:
-            state = "backwardation"
-        else:
-            state = "mixed"
-    else:
-        state = "unknown"
-
-    return {
-        "constant_curve": constant_curve,
-        "implied_curve": implied_curve,
-        "forward_curve": {
-            "fwd30_20": summaries.get("fwd30_20"),
-            "fwd60_30": summaries.get("fwd60_30"),
-            "fwd90_30": summaries.get("fwd90_30"),
-            "fwd90_60": summaries.get("fwd90_60"),
-            "fwd180_90": summaries.get("fwd180_90"),
-        },
-        "state": state,
-        "contango": summaries.get("contango"),
-    }
+def compute_term_structure_by_expiry(
+    records: Sequence[StrikeRecord],
+    atm_tolerance: float = 0.02,
+) -> List[Dict[str, Any]]:
+    """
+    ATM IV term structure: ATM IV for each expiry.
+    """
+    by_exp = group_by_expiry(list(records))
+    results = []
+    for expiry in sorted(by_exp.keys()):
+        strikes = by_exp[expiry]
+        atm = filter_atm(strikes, tolerance=atm_tolerance)
+        if not atm:
+            continue
+        avg_iv = sum((r.call_iv + r.put_iv) / 2 for r in atm) / len(atm)
+        results.append({
+            "expiry_date": expiry,
+            "dte": atm[0].dte,
+            "atm_iv": round(avg_iv, 4),
+            "num_atm_strikes": len(atm),
+        })
+    return results
 
 
-def analyze_surface(
-    rows: List[StrikeRow],
-    metric: str = "VOLATILITY_MID",
-    contract_filter: str = "ntm",
-) -> Dict[str, Any]:
-    filtered = _filter_rows_for_contract(rows, contract_filter)
-
-    expiries = sorted({r.expir_date for r in filtered})
-    strikes = sorted({float(r.strike) for r in filtered})
-
-    point_map: Dict[tuple[str, float], List[float]] = defaultdict(list)
-    points: List[Dict[str, Any]] = []
-
-    for row in filtered:
-        value = _metric_value(row, metric)
-        key = (row.expir_date, float(row.strike))
-        point_map[key].append(value)
-        points.append(
-            {
-                "expiry": row.expir_date,
-                "strike": float(row.strike),
-                "dte": row.dte,
-                "value": value,
-            }
-        )
-
-    matrix: List[List[float | None]] = []
-    for expiry in expiries:
-        row_values: List[float | None] = []
-        for strike in strikes:
-            vals = point_map.get((expiry, strike), [])
-            row_values.append(mean(vals) if vals else None)
-        matrix.append(row_values)
-
-    points.sort(key=lambda x: (x["expiry"], x["strike"]))
-    return {
-        "metric": metric,
-        "expiries": expiries,
-        "strikes": strikes,
-        "matrix": matrix,
-        "points": points,
-    }
-
-
-def _float_or_none(value: Any) -> float | None:
-    try:
-        if value is None:
-            return None
-        return float(value)
-    except (TypeError, ValueError):
+def compute_constant_maturity_iv(
+    term_data: List[Dict[str, Any]],
+    target_dte: int = 30,
+) -> Optional[float]:
+    """
+    Interpolate ATM IV for a constant maturity (e.g. 30-day).
+    Linear interpolation between nearest bracketing expiries.
+    """
+    if not term_data:
         return None
+
+    sorted_data = sorted(term_data, key=lambda x: x["dte"])
+
+    # Exact match
+    for d in sorted_data:
+        if d["dte"] == target_dte:
+            return d["atm_iv"]
+
+    # Find bracketing expiries
+    lower = None
+    upper = None
+    for d in sorted_data:
+        if d["dte"] < target_dte:
+            lower = d
+        elif d["dte"] > target_dte and upper is None:
+            upper = d
+
+    if lower and upper:
+        # Linear interpolation
+        w = (target_dte - lower["dte"]) / (upper["dte"] - lower["dte"])
+        iv = lower["atm_iv"] + w * (upper["atm_iv"] - lower["atm_iv"])
+        return round(iv, 4)
+
+    # Extrapolation fallback
+    if lower:
+        return lower["atm_iv"]
+    if upper:
+        return upper["atm_iv"]
+    return None
+
+
+def detect_contango_state(term_data: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Determine term structure state:
+    - CONTANGO: front < back (normal)
+    - BACKWARDATION: front > back (inverted)
+    - FLAT: approximately equal
+    """
+    if len(term_data) < 2:
+        return {"state": "UNKNOWN", "front_iv": None, "back_iv": None, "ratio": None}
+
+    sorted_data = sorted(term_data, key=lambda x: x["dte"])
+    front = sorted_data[0]
+    back = sorted_data[-1]
+
+    front_iv = front["atm_iv"]
+    back_iv = back["atm_iv"]
+    ratio = front_iv / back_iv if back_iv > 0 else 1.0
+
+    FLAT_THRESHOLD = 0.05  # ±5%
+
+    if ratio < (1 - FLAT_THRESHOLD):
+        state = "CONTANGO"
+    elif ratio > (1 + FLAT_THRESHOLD):
+        state = "BACKWARDATION"
+    else:
+        state = "FLAT"
+
+    return {
+        "state": state,
+        "front_iv": round(front_iv, 4),
+        "front_dte": front["dte"],
+        "back_iv": round(back_iv, 4),
+        "back_dte": back["dte"],
+        "ratio": round(ratio, 4),
+    }
+
+
+# ── Surface Analysis ───────────────────────────────────────────────────
+
+def compute_vol_surface(records: Sequence[StrikeRecord]) -> List[Dict[str, Any]]:
+    """
+    Build a volatility surface matrix: strike × expiry → IV.
+    Returns list of {strike, expiry_date, dte, call_iv, put_iv, mid_iv}.
+    """
+    results = []
+    for r in records:
+        mid_iv = (r.call_iv + r.put_iv) / 2 if (r.call_iv > 0 and r.put_iv > 0) else max(r.call_iv, r.put_iv)
+        moneyness = (r.strike / r.spot_price - 1) if r.spot_price > 0 else 0
+        results.append({
+            "strike": r.strike,
+            "moneyness": round(moneyness, 4),
+            "expiry_date": r.expiry_date,
+            "dte": r.dte,
+            "call_iv": round(r.call_iv, 4),
+            "put_iv": round(r.put_iv, 4),
+            "mid_iv": round(mid_iv, 4),
+        })
+    return sorted(results, key=lambda x: (x["dte"], x["strike"]))

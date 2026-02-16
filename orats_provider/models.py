@@ -1,192 +1,290 @@
+"""
+ORATS data models — all carry a from_orats() factory for JSON deserialization.
+"""
+
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from enum import Enum
+from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional
 
-
-class ExpirationFilter(Enum):
-    WEEKLY = "w"
-    MONTHLY = "m"
-    QUARTERLY = "q"
-    FRONT_DATED = "fd"
-    ALL = "*"
+from .config import STRIKES_FIELD_MAP, SUMMARY_FIELD_MAP, IVRANK_FIELD_MAP
 
 
-class ContractFilter(Enum):
-    CALLS = "calls"
-    PUTS = "puts"
-    ITM = "itm"
-    ATM = "atm"
-    NTM = "ntm"
+def _map_fields(raw: Dict[str, Any], mapping: Dict[str, str]) -> Dict[str, Any]:
+    """Map ORATS JSON keys to internal field names."""
+    out: Dict[str, Any] = {}
+    for orats_key, internal_key in mapping.items():
+        if orats_key in raw:
+            out[internal_key] = raw[orats_key]
+    return out
 
 
-class VolMetric(Enum):
-    IV = "iv"
-    IV_MID = "ivmid"
-    IV_ASK = "ivask"
-    DELTA = "delta"
-    GAMMA = "gamma"
-    VEGA = "vega"
-    RHO = "rho"
-    VOLATILITY_MID = "smvVol"
-
-
-def _to_float(value: Any, default: float = 0.0) -> float:
-    try:
-        if value is None:
-            return default
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _to_int(value: Any, default: int = 0) -> int:
-    try:
-        if value is None:
-            return default
-        return int(float(value))
-    except (TypeError, ValueError):
-        return default
-
+# ── Strike record ───────────────────────────────────────────────────────
 
 @dataclass
-class StrikeRow:
-    ticker: str
-    trade_date: str
-    expir_date: str
-    dte: int
-    strike: float
-    stock_price: float
+class StrikeRecord:
+    """Single strike-level record from ORATS /strikes endpoint."""
+
+    symbol: str = ""
+    trade_date: str = ""
+    expiry_date: str = ""
+    dte: int = 0
+    strike: float = 0.0
+    spot_price: float = 0.0
     call_volume: int = 0
-    call_open_interest: int = 0
     put_volume: int = 0
-    put_open_interest: int = 0
-    call_bid_price: float = 0.0
-    call_value: float = 0.0
-    call_ask_price: float = 0.0
-    put_bid_price: float = 0.0
-    put_value: float = 0.0
-    put_ask_price: float = 0.0
-    call_bid_iv: float = 0.0
-    call_mid_iv: float = 0.0
-    call_ask_iv: float = 0.0
-    put_bid_iv: float = 0.0
-    put_mid_iv: float = 0.0
-    put_ask_iv: float = 0.0
+    call_oi: int = 0
+    put_oi: int = 0
+    call_iv: float = 0.0
+    put_iv: float = 0.0
+    call_delta: float = 0.0
+    put_delta: float = 0.0
+    call_gamma: float = 0.0
+    put_gamma: float = 0.0
+    call_theta: float = 0.0
+    put_theta: float = 0.0
+    call_vega: float = 0.0
+    put_vega: float = 0.0
+    call_bid: float = 0.0
+    call_ask: float = 0.0
+    put_bid: float = 0.0
+    put_ask: float = 0.0
+    call_mid: float = 0.0
+    put_mid: float = 0.0
+    call_smv_vol: float = 0.0
+    put_smv_vol: float = 0.0
+    residual_rate: float = 0.0
+    call_vanna: float = 0.0
+    put_vanna: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_orats(cls, raw: Dict[str, Any]) -> "StrikeRecord":
+        mapped = _map_fields(raw, STRIKES_FIELD_MAP)
+        known = {f.name for f in cls.__dataclass_fields__.values()}
+        return cls(**{k: v for k, v in mapped.items() if k in known})
+
+
+# ── Summary record ──────────────────────────────────────────────────────
+
+@dataclass
+class SummaryRecord:
+    """Summary-level record from ORATS /summaries endpoint."""
+
+    symbol: str = ""
+    trade_date: str = ""
+    spot_price: float = 0.0
+    annual_dividend: float = 0.0
+    implied_dividend: float = 0.0
+    borrow_30: float = 0.0
+    borrow_2y: float = 0.0
+    iv_mean_30: float = 0.0
+    iv_mean_60: float = 0.0
+    iv_mean_90: float = 0.0
+    iv_30: float = 0.0
+    iv_60: float = 0.0
+    iv_90: float = 0.0
+    iv_pct_1m: float = 0.0
+    iv_pct_1y: float = 0.0
+    iv_rank_1m: float = 0.0
+    iv_rank_1y: float = 0.0
+    skew_slope: float = 0.0
+    skew_deriv: float = 0.0
+    next_earning: str = ""
+    confidence: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_orats(cls, raw: Dict[str, Any]) -> "SummaryRecord":
+        mapped = _map_fields(raw, SUMMARY_FIELD_MAP)
+        known = {f.name for f in cls.__dataclass_fields__.values()}
+        return cls(**{k: v for k, v in mapped.items() if k in known})
+
+
+# ── Core (monies/implied) record ────────────────────────────────────────
+
+@dataclass
+class CoreRecord:
+    """Record from ORATS /cores endpoint."""
+
+    symbol: str = ""
+    trade_date: str = ""
+    expiry_date: str = ""
+    dte: int = 0
+    spot_price: float = 0.0
+    strike_pct: float = 0.0
+    call_iv: float = 0.0
+    put_iv: float = 0.0
+    atm_iv: float = 0.0
+    slope: float = 0.0
+    deriv: float = 0.0
+    forecast_iv: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_orats(cls, raw: Dict[str, Any]) -> "CoreRecord":
+        known = {f.name for f in cls.__dataclass_fields__.values()}
+        mapped: Dict[str, Any] = {}
+        remap = {
+            "ticker": "symbol", "tradeDate": "trade_date",
+            "expirDate": "expiry_date", "stockPrice": "spot_price",
+        }
+        for k, v in raw.items():
+            key = remap.get(k, k)
+            if key in known:
+                mapped[key] = v
+        return cls(**mapped)
+
+
+# ── IV Rank record ──────────────────────────────────────────────────────
+
+@dataclass
+class IVRankRecord:
+    """IV Rank / IV Percentile from ORATS /ivrank endpoint."""
+
+    symbol: str = ""
+    trade_date: str = ""
+    iv_rank_1m: float = 0.0
+    iv_rank_3m: float = 0.0
+    iv_rank_6m: float = 0.0
+    iv_rank_1y: float = 0.0
+    iv_pct_1m: float = 0.0
+    iv_pct_3m: float = 0.0
+    iv_pct_6m: float = 0.0
+    iv_pct_1y: float = 0.0
+    iv_30: float = 0.0
+    iv_60: float = 0.0
+    iv_90: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_orats(cls, raw: Dict[str, Any]) -> "IVRankRecord":
+        mapped = _map_fields(raw, IVRANK_FIELD_MAP)
+        known = {f.name for f in cls.__dataclass_fields__.values()}
+        return cls(**{k: v for k, v in mapped.items() if k in known})
+
+
+# ── Monies/Implied record ──────────────────────────────────────────────
+
+@dataclass
+class MoniesRecord:
+    """Record from ORATS /monies/implied endpoint."""
+
+    symbol: str = ""
+    trade_date: str = ""
+    expiry_date: str = ""
+    dte: int = 0
+    spot_price: float = 0.0
+    atm_iv: float = 0.0
     smv_vol: float = 0.0
+    call_smv_vol: float = 0.0
+    put_smv_vol: float = 0.0
+    slope: float = 0.0
+    deriv: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_orats(cls, raw: Dict[str, Any]) -> "MoniesRecord":
+        known = {f.name for f in cls.__dataclass_fields__.values()}
+        remap = {
+            "ticker": "symbol", "tradeDate": "trade_date",
+            "expirDate": "expiry_date", "stockPrice": "spot_price",
+            "atmIv": "atm_iv", "smvVol": "smv_vol",
+            "callSmvVol": "call_smv_vol", "putSmvVol": "put_smv_vol",
+        }
+        mapped: Dict[str, Any] = {}
+        for k, v in raw.items():
+            key = remap.get(k, k)
+            if key in known:
+                mapped[key] = v
+        return cls(**mapped)
+
+
+# ── Option chain record ────────────────────────────────────────────────
+
+@dataclass
+class OptionRecord:
+    """Single option from ORATS /strikes/options endpoint."""
+
+    symbol: str = ""
+    trade_date: str = ""
+    expiry_date: str = ""
+    dte: int = 0
+    strike: float = 0.0
+    spot_price: float = 0.0
+    option_type: str = ""       # "call" or "put"
+    bid: float = 0.0
+    ask: float = 0.0
+    mid: float = 0.0
+    volume: int = 0
+    open_interest: int = 0
+    iv: float = 0.0
     delta: float = 0.0
     gamma: float = 0.0
     theta: float = 0.0
     vega: float = 0.0
-    rho: float = 0.0
-    phi: float = 0.0
-    ext_smv_vol: float = 0.0
-    spot_price: float = 0.0
+    vanna: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
 
     @classmethod
-    def from_orats(cls, row: Dict[str, Any]) -> "StrikeRow":
-        return cls(
-            ticker=str(row.get("ticker", "") or ""),
-            trade_date=str(row.get("tradeDate", "") or ""),
-            expir_date=str(row.get("expirDate", "") or ""),
-            dte=_to_int(row.get("dte", 0)),
-            strike=_to_float(row.get("strike", 0.0)),
-            stock_price=_to_float(row.get("stockPrice", 0.0)),
-            call_volume=_to_int(row.get("callVolume", 0)),
-            call_open_interest=_to_int(row.get("callOpenInterest", 0)),
-            put_volume=_to_int(row.get("putVolume", 0)),
-            put_open_interest=_to_int(row.get("putOpenInterest", 0)),
-            call_bid_price=_to_float(row.get("callBidPrice", 0.0)),
-            call_value=_to_float(row.get("callValue", 0.0)),
-            call_ask_price=_to_float(row.get("callAskPrice", 0.0)),
-            put_bid_price=_to_float(row.get("putBidPrice", 0.0)),
-            put_value=_to_float(row.get("putValue", 0.0)),
-            put_ask_price=_to_float(row.get("putAskPrice", 0.0)),
-            call_bid_iv=_to_float(row.get("callBidIv", 0.0)),
-            call_mid_iv=_to_float(row.get("callMidIv", 0.0)),
-            call_ask_iv=_to_float(row.get("callAskIv", 0.0)),
-            put_bid_iv=_to_float(row.get("putBidIv", 0.0)),
-            put_mid_iv=_to_float(row.get("putMidIv", 0.0)),
-            put_ask_iv=_to_float(row.get("putAskIv", 0.0)),
-            smv_vol=_to_float(row.get("smvVol", 0.0)),
-            delta=_to_float(row.get("delta", 0.0)),
-            gamma=_to_float(row.get("gamma", 0.0)),
-            theta=_to_float(row.get("theta", 0.0)),
-            vega=_to_float(row.get("vega", 0.0)),
-            rho=_to_float(row.get("rho", 0.0)),
-            phi=_to_float(row.get("phi", 0.0)),
-            ext_smv_vol=_to_float(row.get("extSmvVol", 0.0)),
-            spot_price=_to_float(row.get("spotPrice", row.get("stockPrice", 0.0))),
-        )
+    def from_orats(cls, raw: Dict[str, Any], option_type: str = "call") -> "OptionRecord":
+        prefix = "call" if option_type == "call" else "put"
+        mapped = _map_fields(raw, STRIKES_FIELD_MAP)
+        mapped["option_type"] = option_type
+        mapped["bid"] = mapped.get(f"{prefix}_bid", 0.0)
+        mapped["ask"] = mapped.get(f"{prefix}_ask", 0.0)
+        mapped["mid"] = mapped.get(f"{prefix}_mid", 0.0)
+        mapped["volume"] = mapped.get(f"{prefix}_volume", 0)
+        mapped["open_interest"] = mapped.get(f"{prefix}_oi", 0)
+        mapped["iv"] = mapped.get(f"{prefix}_iv", 0.0)
+        mapped["delta"] = mapped.get(f"{prefix}_delta", 0.0)
+        mapped["gamma"] = mapped.get(f"{prefix}_gamma", 0.0)
+        mapped["theta"] = mapped.get(f"{prefix}_theta", 0.0)
+        mapped["vega"] = mapped.get(f"{prefix}_vega", 0.0)
+        mapped["vanna"] = mapped.get(f"{prefix}_vanna", 0.0)
+        known = {f.name for f in cls.__dataclass_fields__.values()}
+        return cls(**{k: v for k, v in mapped.items() if k in known})
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "ticker": self.ticker,
-            "tradeDate": self.trade_date,
-            "expirDate": self.expir_date,
-            "dte": self.dte,
-            "strike": self.strike,
-            "stockPrice": self.stock_price,
-            "callVolume": self.call_volume,
-            "callOpenInterest": self.call_open_interest,
-            "putVolume": self.put_volume,
-            "putOpenInterest": self.put_open_interest,
-            "callMidIv": self.call_mid_iv,
-            "putMidIv": self.put_mid_iv,
-            "smvVol": self.smv_vol,
-            "delta": self.delta,
-            "gamma": self.gamma,
-            "theta": self.theta,
-            "vega": self.vega,
-            "rho": self.rho,
-            "spotPrice": self.spot_price,
-        }
 
+# ── Result containers ───────────────────────────────────────────────────
 
 @dataclass
-class ExposureResult:
-    symbol: str
-    as_of: str
-    metric_name: str
-    total_exposure: float
-    net_exposure: float
-    by_strike: List[Dict[str, Any]] = field(default_factory=list)
-    by_expiry: List[Dict[str, Any]] = field(default_factory=list)
-    gamma_flip_strike: Optional[float] = None
-    spot_price: float = 0.0
-    parameters: Dict[str, Any] = field(default_factory=dict)
+class GreeksExposureResult:
+    """Container for Greeks exposure calculation results."""
+
+    symbol: str = ""
+    command: str = ""
+    data: Dict[str, Any] = field(default_factory=dict)
+    summary: Dict[str, Any] = field(default_factory=dict)
+    chart_data: List[Dict[str, Any]] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            "symbol": self.symbol,
-            "as_of": self.as_of,
-            "metric_name": self.metric_name,
-            "total_exposure": self.total_exposure,
-            "net_exposure": self.net_exposure,
-            "by_strike": self.by_strike,
-            "by_expiry": self.by_expiry,
-            "gamma_flip_strike": self.gamma_flip_strike,
-            "spot_price": self.spot_price,
-            "parameters": self.parameters,
-        }
+        return asdict(self)
 
 
 @dataclass
 class VolatilityResult:
-    symbol: str
-    as_of: str
-    metric_name: str
+    """Container for volatility analysis results."""
+
+    symbol: str = ""
+    command: str = ""
     data: Dict[str, Any] = field(default_factory=dict)
-    spot_price: float = 0.0
-    parameters: Dict[str, Any] = field(default_factory=dict)
+    summary: Dict[str, Any] = field(default_factory=dict)
+    chart_data: List[Dict[str, Any]] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            "symbol": self.symbol,
-            "as_of": self.as_of,
-            "metric_name": self.metric_name,
-            "data": self.data,
-            "spot_price": self.spot_price,
-            "parameters": self.parameters,
-        }
+        return asdict(self)

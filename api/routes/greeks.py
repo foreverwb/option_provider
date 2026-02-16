@@ -1,37 +1,41 @@
+"""
+Greeks Exposure routes — /api/v1/greeks/{command}/{symbol}
+9 commands: gex, net_gex, gex_distribution, gex_3d, dex, net_dex, vex, net_vex, vanna
+"""
+
 from __future__ import annotations
 
 from typing import Any, Dict
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query
 
-from provider.unified import UnifiedProvider
+from api.dependencies import get_provider
+from orats_provider.greeks_exposure.commands import COMMANDS
 
-
-def get_provider() -> UnifiedProvider:
-    from api.app import provider
-
-    return provider
-
-
-router = APIRouter(prefix="/greeks", tags=["greeks"])
+router = APIRouter(prefix="/api/v1/greeks", tags=["greeks"])
 
 
 @router.get("/{command}/{symbol}")
-def greeks_exposure(
+async def greeks_command(
     command: str,
     symbol: str,
-    strikes: int = Query(default=15),
-    dte: int = Query(default=98),
-    expiration_filter: str = Query(default="*"),
-    unified: UnifiedProvider = Depends(get_provider),
+    dte_min: int = Query(0, ge=0),
+    dte_max: int = Query(90, ge=1),
+    moneyness: float = Query(0.20, ge=0.01, le=1.0),
 ) -> Dict[str, Any]:
-    valid = {"gex", "gexn", "gexr", "gexs", "dex", "dexn", "vex", "vexn", "vanna"}
-    if command not in valid:
-        raise HTTPException(status_code=400, detail=f"Unknown command: {command}")
-
+    """Execute a Greeks exposure command."""
+    if command not in COMMANDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown command '{command}'. Available: {COMMANDS}",
+        )
     try:
-        fn = getattr(unified, command)
-        result = fn(symbol, strikes=strikes, dte=dte, expiration_filter=expiration_filter)
-        return {"success": True, "data": result.to_dict()}
-    except Exception as exc:  # pragma: no cover - runtime guard
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        provider = get_provider()
+        return provider.greeks(
+            symbol, command,
+            dte_min=dte_min, dte_max=dte_max, moneyness=moneyness,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))

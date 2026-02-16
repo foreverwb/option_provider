@@ -1,157 +1,169 @@
 """
-Common utility helpers for ORATS processing.
+Utility functions for filtering and grouping option data.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional
+import math
+from datetime import datetime, date
+from typing import Any, Dict, List, Optional, Sequence
 
-from .models import ContractFilter, ExpirationFilter
-
-
-def filter_by_dte(strikes: List[Dict[str, Any]], max_dte: int) -> List[Dict[str, Any]]:
-    return [s for s in strikes if int(s.get("dte", 0)) <= int(max_dte)]
+from .models import StrikeRecord
 
 
-def filter_by_strikes_range(
-    strikes: List[Dict[str, Any]],
-    spot_price: float,
-    num_strikes: int = 15,
-) -> List[Dict[str, Any]]:
-    if not strikes:
-        return []
+# ── DTE filtering ───────────────────────────────────────────────────────
 
-    unique_strikes = sorted({float(s.get("strike", 0.0)) for s in strikes})
-    if not unique_strikes:
-        return []
-
-    atm_idx = min(range(len(unique_strikes)), key=lambda i: abs(unique_strikes[i] - spot_price))
-    low = max(0, atm_idx - num_strikes)
-    high = min(len(unique_strikes), atm_idx + num_strikes + 1)
-    valid = set(unique_strikes[low:high])
-    return [s for s in strikes if float(s.get("strike", 0.0)) in valid]
+def filter_by_dte(
+    records: Sequence[StrikeRecord],
+    dte_min: int = 0,
+    dte_max: int = 365,
+) -> List[StrikeRecord]:
+    """Keep records whose DTE is within [dte_min, dte_max]."""
+    return [r for r in records if dte_min <= r.dte <= dte_max]
 
 
-def classify_expiration(expir_date_str: str) -> str:
-    dt = datetime.strptime(expir_date_str, "%Y-%m-%d")
-    weekday = dt.weekday()  # Monday=0
-    month = dt.month
+# ── Moneyness filtering ────────────────────────────────────────────────
 
-    # Third Friday of month.
-    first_day = dt.replace(day=1)
-    first_friday_delta = (4 - first_day.weekday()) % 7
-    first_friday = 1 + first_friday_delta
-    third_friday = first_friday + 14
-
-    is_third_friday = weekday == 4 and dt.day == third_friday
-    is_quarter = month in {3, 6, 9, 12} and is_third_friday
-
-    if is_quarter:
-        return "quarterly"
-    if is_third_friday:
-        return "monthly"
-    return "weekly"
-
-
-def filter_by_expiration_type(
-    strikes: List[Dict[str, Any]],
-    exp_filter: ExpirationFilter,
-) -> List[Dict[str, Any]]:
-    if exp_filter == ExpirationFilter.ALL:
-        return strikes
-
-    if exp_filter == ExpirationFilter.WEEKLY:
-        return [s for s in strikes if int(s.get("dte", 0)) <= 7]
-
-    if exp_filter == ExpirationFilter.FRONT_DATED:
-        if not strikes:
-            return []
-        min_dte = min(int(s.get("dte", 0)) for s in strikes)
-        return [s for s in strikes if int(s.get("dte", 0)) == min_dte]
-
-    out: List[Dict[str, Any]] = []
-    for row in strikes:
-        expir = row.get("expirDate")
-        if not expir:
+def filter_by_moneyness(
+    records: Sequence[StrikeRecord],
+    moneyness_range: float = 0.20,
+) -> List[StrikeRecord]:
+    """Keep records within ±moneyness_range of spot price."""
+    result = []
+    for r in records:
+        if r.spot_price <= 0:
             continue
+        pct = abs(r.strike - r.spot_price) / r.spot_price
+        if pct <= moneyness_range:
+            result.append(r)
+    return result
+
+
+def filter_atm(
+    records: Sequence[StrikeRecord],
+    tolerance: float = 0.02,
+) -> List[StrikeRecord]:
+    """Keep only near-ATM records within tolerance of spot."""
+    return [
+        r for r in records
+        if r.spot_price > 0 and abs(r.strike - r.spot_price) / r.spot_price <= tolerance
+    ]
+
+
+# ── Expiry type classification ──────────────────────────────────────────
+
+def classify_expiry_type(expiry_date: str) -> str:
+    """
+    Classify an expiration date as WEEKLY, MONTHLY, or QUARTERLY.
+    Monthly = 3rd Friday of month; Quarterly = month in {3,6,9,12}.
+    """
+    try:
+        dt = _parse_date(expiry_date)
+    except (ValueError, TypeError):
+        return "UNKNOWN"
+
+    # Check if 3rd Friday of month
+    first_day = dt.replace(day=1)
+    # weekday: Mon=0 … Fri=4
+    first_friday = 1 + (4 - first_day.weekday()) % 7
+    third_friday = first_friday + 14
+    is_monthly = dt.day == third_friday
+
+    if is_monthly:
+        if dt.month in (3, 6, 9, 12):
+            return "QUARTERLY"
+        return "MONTHLY"
+    return "WEEKLY"
+
+
+def filter_by_expiry_type(
+    records: Sequence[StrikeRecord],
+    expiry_type: str,
+) -> List[StrikeRecord]:
+    """Keep only records matching the given expiry type (WEEKLY/MONTHLY/QUARTERLY)."""
+    return [r for r in records if classify_expiry_type(r.expiry_date) == expiry_type.upper()]
+
+
+# ── Contract type filtering ─────────────────────────────────────────────
+
+def filter_calls(records: Sequence[StrikeRecord]) -> List[StrikeRecord]:
+    """All records have both call/put; this is a no-op identity (for semantics)."""
+    return list(records)
+
+
+def filter_puts(records: Sequence[StrikeRecord]) -> List[StrikeRecord]:
+    return list(records)
+
+
+# ── Grouping ────────────────────────────────────────────────────────────
+
+def group_by_expiry(records: Sequence[StrikeRecord]) -> Dict[str, List[StrikeRecord]]:
+    """Group strike records by expiry_date."""
+    groups: Dict[str, List[StrikeRecord]] = {}
+    for r in records:
+        groups.setdefault(r.expiry_date, []).append(r)
+    return groups
+
+
+def group_by_strike(records: Sequence[StrikeRecord]) -> Dict[float, List[StrikeRecord]]:
+    """Group strike records by strike price."""
+    groups: Dict[float, List[StrikeRecord]] = {}
+    for r in records:
+        groups.setdefault(r.strike, []).append(r)
+    return groups
+
+
+# ── Helpers ─────────────────────────────────────────────────────────────
+
+def compute_dte(expiry_date: str, from_date: Optional[str] = None) -> int:
+    """Compute days to expiration from a reference date (default: today)."""
+    exp = _parse_date(expiry_date)
+    ref = _parse_date(from_date) if from_date else date.today()
+    return max(0, (exp - ref).days)
+
+
+def _parse_date(s: Any) -> date:
+    """Parse a date string in common formats."""
+    if isinstance(s, date):
+        return s
+    if isinstance(s, datetime):
+        return s.date()
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%Y%m%d"):
         try:
-            kind = classify_expiration(str(expir))
+            return datetime.strptime(str(s), fmt).date()
         except ValueError:
             continue
-
-        if exp_filter == ExpirationFilter.MONTHLY and kind == "monthly":
-            out.append(row)
-        elif exp_filter == ExpirationFilter.QUARTERLY and kind == "quarterly":
-            out.append(row)
-
-    return out
+    raise ValueError(f"Cannot parse date: {s}")
 
 
-def parse_expiration_filter(value: str | ExpirationFilter | None) -> ExpirationFilter:
-    if isinstance(value, ExpirationFilter):
-        return value
+def find_gamma_flip(
+    records: Sequence[StrikeRecord],
+) -> Optional[float]:
+    """
+    Find the strike price where net gamma flips from positive to negative.
+    Net gamma = sum of call_gamma * call_oi - put_gamma * put_oi across OI.
+    Returns the strike price of the flip point, or None if not found.
+    """
+    by_strike = group_by_strike(records)
+    net_gammas = []
+    for strike in sorted(by_strike.keys()):
+        strikes = by_strike[strike]
+        net_g = sum(
+            (r.call_gamma * r.call_oi * 100 - r.put_gamma * r.put_oi * 100)
+            for r in strikes
+        )
+        net_gammas.append((strike, net_g))
 
-    raw = str(value or "*").strip().lower()
-    try:
-        return ExpirationFilter(raw)
-    except ValueError:
-        return ExpirationFilter.ALL
-
-
-def parse_contract_filter(value: str | ContractFilter | None) -> ContractFilter:
-    if isinstance(value, ContractFilter):
-        return value
-    raw = str(value or "ntm").strip().lower()
-    try:
-        return ContractFilter(raw)
-    except ValueError:
-        return ContractFilter.NTM
-
-
-def chunked_tickers(tickers: Iterable[str], chunk_size: int = 10) -> List[List[str]]:
-    cleaned = [t.strip().upper() for t in tickers if isinstance(t, str) and t.strip()]
-    return [cleaned[i : i + chunk_size] for i in range(0, len(cleaned), chunk_size)]
-
-
-def is_atm(strike: float, spot: float, tolerance: float = 0.02) -> bool:
-    if spot <= 0:
-        return False
-    return abs(strike - spot) / spot <= tolerance
-
-
-def contract_side_value(row: Dict[str, Any], side: str, metric_key: str) -> Optional[float]:
-    side = side.lower()
-    metric_key = metric_key.lower()
-
-    if metric_key == "iv":
-        metric_key = "midiv"
-
-    if side == "calls":
-        mapping = {
-            "midiv": row.get("callMidIv"),
-            "bidiv": row.get("callBidIv"),
-            "askiv": row.get("callAskIv"),
-            "value": row.get("callValue"),
-        }
-        return _to_optional_float(mapping.get(metric_key))
-
-    if side == "puts":
-        mapping = {
-            "midiv": row.get("putMidIv"),
-            "bidiv": row.get("putBidIv"),
-            "askiv": row.get("putAskIv"),
-            "value": row.get("putValue"),
-        }
-        return _to_optional_float(mapping.get(metric_key))
+    # Find zero crossing
+    for i in range(1, len(net_gammas)):
+        prev_strike, prev_g = net_gammas[i - 1]
+        curr_strike, curr_g = net_gammas[i]
+        if prev_g >= 0 and curr_g < 0:
+            # Linear interpolation
+            if abs(prev_g - curr_g) > 1e-12:
+                flip = prev_strike + (curr_strike - prev_strike) * prev_g / (prev_g - curr_g)
+            else:
+                flip = (prev_strike + curr_strike) / 2
+            return round(flip, 2)
 
     return None
-
-
-def _to_optional_float(value: Any) -> Optional[float]:
-    try:
-        if value is None:
-            return None
-        return float(value)
-    except (TypeError, ValueError):
-        return None

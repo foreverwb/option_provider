@@ -1,266 +1,155 @@
 """
-Greeks exposure command entrypoints.
+Greeks Exposure command pipeline — fetch → filter → compute.
+Each command function takes an OratsClient + symbol and returns a GreeksExposureResult.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional
 
-from ..client import OratsClient
-from ..config import DEFAULT_DTE, DEFAULT_EXPIRATION_FILTER, DEFAULT_STRIKES_RANGE
-from ..models import ExpirationFilter, ExposureResult, StrikeRow
-from ..utils import (
-    filter_by_dte,
-    filter_by_expiration_type,
-    filter_by_strikes_range,
-    parse_expiration_filter,
-)
-from .calculator import (
-    compute_delta_exposure,
-    compute_gamma_3d,
-    compute_gamma_by_strike,
-    compute_gamma_exposure,
-    compute_net_delta,
-    compute_net_gamma,
-    compute_net_vega,
-    compute_vanna_exposure,
-    compute_vega_exposure,
-)
+from ..models import StrikeRecord, GreeksExposureResult
+from ..utils import filter_by_dte, filter_by_moneyness, find_gamma_flip
+from . import calculator
 
 
-class GreeksExposureCommands:
-    def __init__(self, orats_client: OratsClient):
-        self.orats = orats_client
+# ── Command registry ────────────────────────────────────────────────────
 
-    def _fetch_and_filter(
-        self,
-        symbol: str,
-        strikes: int = DEFAULT_STRIKES_RANGE,
-        dte: int = DEFAULT_DTE,
-        expiration_filter: str = DEFAULT_EXPIRATION_FILTER,
-    ) -> Tuple[List[StrikeRow], float, str]:
-        raw = self.orats.get_strikes(
-            ticker=symbol.upper(),
-            dte=f"0,{dte}",
-            fields=(
-                "ticker,tradeDate,expirDate,dte,strike,stockPrice,"
-                "callVolume,callOpenInterest,putVolume,putOpenInterest,"
-                "callMidIv,putMidIv,smvVol,delta,gamma,theta,vega,rho,spotPrice"
-            ),
-        )
-        if not raw:
-            raise ValueError(f"No strikes data for {symbol}")
+COMMANDS = [
+    "gex", "net_gex", "gex_distribution", "gex_3d",
+    "dex", "net_dex", "vex", "net_vex", "vanna",
+]
 
-        spot_price = float(raw[0].get("spotPrice") or raw[0].get("stockPrice") or 0.0)
-        rows_dict = filter_by_dte(raw, dte)
-        rows_dict = filter_by_strikes_range(rows_dict, spot_price, strikes)
 
-        exp_enum: ExpirationFilter = parse_expiration_filter(expiration_filter)
-        rows_dict = filter_by_expiration_type(rows_dict, exp_enum)
-        if not rows_dict:
-            raise ValueError(
-                f"No strikes left after filters for {symbol} (dte={dte}, expiration_filter={expiration_filter})"
-            )
+def _fetch_and_filter(
+    client: Any,
+    symbol: str,
+    dte_min: int = 0,
+    dte_max: int = 90,
+    moneyness: float = 0.20,
+) -> List[StrikeRecord]:
+    """Common fetch + filter pipeline."""
+    records = client.get_strikes(symbol)
+    records = filter_by_dte(records, dte_min, dte_max)
+    records = filter_by_moneyness(records, moneyness)
+    return records
 
-        rows = [StrikeRow.from_orats(r) for r in rows_dict]
-        as_of = rows[0].trade_date if rows else ""
-        return rows, spot_price, as_of
 
-    def gex(
-        self,
-        symbol: str,
-        strikes: int = DEFAULT_STRIKES_RANGE,
-        dte: int = DEFAULT_DTE,
-        expiration_filter: str = DEFAULT_EXPIRATION_FILTER,
-    ) -> ExposureResult:
-        data, spot, as_of = self._fetch_and_filter(symbol, strikes, dte, expiration_filter)
-        result = compute_gamma_exposure(data, spot)
-        return ExposureResult(
-            symbol=symbol.upper(),
-            as_of=as_of,
-            metric_name="gex",
-            total_exposure=result["total_gex"],
-            net_exposure=result["total_gex"],
-            by_strike=result["by_strike"],
-            by_expiry=result.get("by_expiry", []),
-            spot_price=spot,
-            parameters={"strikes": strikes, "dte": dte, "expiration_filter": expiration_filter},
+def execute(
+    client: Any,
+    symbol: str,
+    command: str,
+    dte_min: int = 0,
+    dte_max: int = 90,
+    moneyness: float = 0.20,
+    **kwargs: Any,
+) -> GreeksExposureResult:
+    """Execute a Greeks exposure command."""
+    records = _fetch_and_filter(client, symbol, dte_min, dte_max, moneyness)
+    return _dispatch(command, symbol, records)
+
+
+def execute_from_records(
+    command: str,
+    symbol: str,
+    records: List[StrikeRecord],
+) -> GreeksExposureResult:
+    """Execute a command on pre-fetched records (useful for testing)."""
+    return _dispatch(command, symbol, records)
+
+
+def _dispatch(
+    command: str,
+    symbol: str,
+    records: List[StrikeRecord],
+) -> GreeksExposureResult:
+    """Route to the appropriate calculator function."""
+    cmd = command.lower().strip()
+
+    if cmd == "gex":
+        data = calculator.compute_gex_per_strike(records)
+        net = calculator.compute_net_gex(records)
+        flip = find_gamma_flip(records)
+        return GreeksExposureResult(
+            symbol=symbol, command=cmd,
+            data={"per_strike": data},
+            summary={"net_gex": net, "gamma_flip_strike": flip, "num_strikes": len(data)},
+            chart_data=data,
+            metadata={"unit": "$ notional"},
         )
 
-    def gexn(
-        self,
-        symbol: str,
-        strikes: int = DEFAULT_STRIKES_RANGE,
-        dte: int = DEFAULT_DTE,
-        expiration_filter: str = DEFAULT_EXPIRATION_FILTER,
-    ) -> ExposureResult:
-        data, spot, as_of = self._fetch_and_filter(symbol, strikes, dte, expiration_filter)
-        result = compute_net_gamma(data, spot)
-        return ExposureResult(
-            symbol=symbol.upper(),
-            as_of=as_of,
-            metric_name="gexn",
-            total_exposure=result["total_gex"],
-            net_exposure=result["total_gex"],
-            by_strike=result["by_strike"],
-            by_expiry=result.get("by_expiry", []),
-            gamma_flip_strike=result.get("gamma_flip_strike"),
-            spot_price=spot,
-            parameters={"strikes": strikes, "dte": dte, "expiration_filter": expiration_filter},
+    elif cmd == "net_gex":
+        net = calculator.compute_net_gex(records)
+        flip = find_gamma_flip(records)
+        return GreeksExposureResult(
+            symbol=symbol, command=cmd,
+            data={"net_gex": net},
+            summary={"net_gex": net, "gamma_flip_strike": flip},
         )
 
-    def gexr(
-        self,
-        symbol: str,
-        strikes: int = DEFAULT_STRIKES_RANGE,
-        dte: int = DEFAULT_DTE,
-        expiration_filter: str = DEFAULT_EXPIRATION_FILTER,
-    ) -> ExposureResult:
-        data, spot, as_of = self._fetch_and_filter(symbol, strikes, dte, expiration_filter)
-        result = compute_gamma_by_strike(data, spot)
-        return ExposureResult(
-            symbol=symbol.upper(),
-            as_of=as_of,
-            metric_name="gexr",
-            total_exposure=result["total_gex"],
-            net_exposure=result["total_gex"],
-            by_strike=result["by_strike"],
-            spot_price=spot,
-            parameters={
-                "strikes": strikes,
-                "dte": dte,
-                "expiration_filter": expiration_filter,
-                "magnet_strike": result.get("magnet_strike"),
-            },
+    elif cmd == "gex_distribution":
+        dist = calculator.compute_gex_distribution(records)
+        net = calculator.compute_net_gex(records)
+        return GreeksExposureResult(
+            symbol=symbol, command=cmd,
+            data={"distribution": dist},
+            summary={"net_gex": net, "num_strikes": len(dist)},
+            chart_data=dist,
         )
 
-    def gexs(
-        self,
-        symbol: str,
-        strikes: int = DEFAULT_STRIKES_RANGE,
-        dte: int = DEFAULT_DTE,
-        expiration_filter: str = DEFAULT_EXPIRATION_FILTER,
-    ) -> ExposureResult:
-        data, spot, as_of = self._fetch_and_filter(symbol, strikes, dte, expiration_filter)
-        result = compute_gamma_3d(data, spot)
-        total = sum(float(item.get("net_gex", 0.0)) for item in result.get("points", []))
-        return ExposureResult(
-            symbol=symbol.upper(),
-            as_of=as_of,
-            metric_name="gexs",
-            total_exposure=total,
-            net_exposure=total,
-            by_strike=result.get("points", []),
-            by_expiry=result.get("by_expiry", []),
-            spot_price=spot,
-            parameters={"strikes": strikes, "dte": dte, "expiration_filter": expiration_filter},
+    elif cmd == "gex_3d":
+        matrix = calculator.compute_gex_3d(records)
+        return GreeksExposureResult(
+            symbol=symbol, command=cmd,
+            data={"matrix": matrix},
+            summary={"num_points": len(matrix)},
+            chart_data=matrix,
         )
 
-    # Common aliases used in some tables/UI docs.
-    def sgex(self, symbol: str, strikes: int = 15, dte: int = 98, expiration_filter: str = "*") -> ExposureResult:
-        return self.gexs(symbol, strikes=strikes, dte=dte, expiration_filter=expiration_filter)
-
-    def sagex(
-        self, symbol: str, strikes: int = 15, dte: int = 98, expiration_filter: str = "*"
-    ) -> ExposureResult:
-        return self.gexs(symbol, strikes=strikes, dte=dte, expiration_filter=expiration_filter)
-
-    def dex(
-        self,
-        symbol: str,
-        strikes: int = DEFAULT_STRIKES_RANGE,
-        dte: int = DEFAULT_DTE,
-        expiration_filter: str = DEFAULT_EXPIRATION_FILTER,
-    ) -> ExposureResult:
-        data, spot, as_of = self._fetch_and_filter(symbol, strikes, dte, expiration_filter)
-        result = compute_delta_exposure(data)
-        return ExposureResult(
-            symbol=symbol.upper(),
-            as_of=as_of,
-            metric_name="dex",
-            total_exposure=result["total_dex"],
-            net_exposure=result["total_dex"],
-            by_strike=result["by_strike"],
-            spot_price=spot,
-            parameters={"strikes": strikes, "dte": dte, "expiration_filter": expiration_filter},
+    elif cmd == "dex":
+        data = calculator.compute_dex_per_strike(records)
+        net = calculator.compute_net_dex(records)
+        return GreeksExposureResult(
+            symbol=symbol, command=cmd,
+            data={"per_strike": data},
+            summary={"net_dex": net, "num_strikes": len(data)},
+            chart_data=data,
         )
 
-    def dexn(
-        self,
-        symbol: str,
-        strikes: int = DEFAULT_STRIKES_RANGE,
-        dte: int = DEFAULT_DTE,
-        expiration_filter: str = DEFAULT_EXPIRATION_FILTER,
-    ) -> ExposureResult:
-        data, spot, as_of = self._fetch_and_filter(symbol, strikes, dte, expiration_filter)
-        result = compute_net_delta(data)
-        return ExposureResult(
-            symbol=symbol.upper(),
-            as_of=as_of,
-            metric_name="dexn",
-            total_exposure=result["total_dex"],
-            net_exposure=result["net_dex"],
-            by_strike=result["by_strike"],
-            spot_price=spot,
-            parameters={"strikes": strikes, "dte": dte, "expiration_filter": expiration_filter},
+    elif cmd == "net_dex":
+        net = calculator.compute_net_dex(records)
+        return GreeksExposureResult(
+            symbol=symbol, command=cmd,
+            data={"net_dex": net},
+            summary={"net_dex": net},
         )
 
-    def vex(
-        self,
-        symbol: str,
-        strikes: int = DEFAULT_STRIKES_RANGE,
-        dte: int = DEFAULT_DTE,
-        expiration_filter: str = DEFAULT_EXPIRATION_FILTER,
-    ) -> ExposureResult:
-        data, spot, as_of = self._fetch_and_filter(symbol, strikes, dte, expiration_filter)
-        result = compute_vega_exposure(data)
-        return ExposureResult(
-            symbol=symbol.upper(),
-            as_of=as_of,
-            metric_name="vex",
-            total_exposure=result["total_vex"],
-            net_exposure=result["total_vex"],
-            by_strike=result["by_strike"],
-            spot_price=spot,
-            parameters={"strikes": strikes, "dte": dte, "expiration_filter": expiration_filter},
+    elif cmd == "vex":
+        data = calculator.compute_vex_per_strike(records)
+        net = calculator.compute_net_vex(records)
+        return GreeksExposureResult(
+            symbol=symbol, command=cmd,
+            data={"per_strike": data},
+            summary={"net_vex": net, "num_strikes": len(data)},
+            chart_data=data,
         )
 
-    def vexn(
-        self,
-        symbol: str,
-        strikes: int = DEFAULT_STRIKES_RANGE,
-        dte: int = DEFAULT_DTE,
-        expiration_filter: str = DEFAULT_EXPIRATION_FILTER,
-    ) -> ExposureResult:
-        data, spot, as_of = self._fetch_and_filter(symbol, strikes, dte, expiration_filter)
-        result = compute_net_vega(data)
-        return ExposureResult(
-            symbol=symbol.upper(),
-            as_of=as_of,
-            metric_name="vexn",
-            total_exposure=result["total_call_vex"] + result["total_put_vex"],
-            net_exposure=result["total_net_vex"],
-            by_strike=result["by_strike"],
-            spot_price=spot,
-            parameters={"strikes": strikes, "dte": dte, "expiration_filter": expiration_filter},
+    elif cmd == "net_vex":
+        net = calculator.compute_net_vex(records)
+        return GreeksExposureResult(
+            symbol=symbol, command=cmd,
+            data={"net_vex": net},
+            summary={"net_vex": net},
         )
 
-    def vanna(
-        self,
-        symbol: str,
-        strikes: int = DEFAULT_STRIKES_RANGE,
-        dte: int = DEFAULT_DTE,
-        expiration_filter: str = DEFAULT_EXPIRATION_FILTER,
-    ) -> ExposureResult:
-        data, spot, as_of = self._fetch_and_filter(symbol, strikes, dte, expiration_filter)
-        result = compute_vanna_exposure(data, spot)
-        return ExposureResult(
-            symbol=symbol.upper(),
-            as_of=as_of,
-            metric_name="vanna",
-            total_exposure=result["total_vanna_exp"],
-            net_exposure=result["total_vanna_exp"],
-            by_strike=result["by_strike"],
-            spot_price=spot,
-            parameters={"strikes": strikes, "dte": dte, "expiration_filter": expiration_filter},
+    elif cmd == "vanna":
+        data = calculator.compute_vanna_per_strike(records)
+        net = calculator.compute_net_vanna(records)
+        return GreeksExposureResult(
+            symbol=symbol, command=cmd,
+            data={"per_strike": data},
+            summary={"net_vanna": net, "num_strikes": len(data)},
+            chart_data=data,
         )
+
+    else:
+        raise ValueError(f"Unknown Greeks command: {command}. Available: {COMMANDS}")

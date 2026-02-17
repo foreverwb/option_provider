@@ -1,0 +1,34 @@
+[project]
+name = "options-provider"
+version = "1.0.0"
+description = "Unified options analysis service — Bridge API + ORATS"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.28.0",
+    "httpx>=0.24.0",
+    "fastapi>=0.100.0",
+    "uvicorn>=0.22.0",
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+]
+
+[project.scripts]
+options-provider = "cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-v --tb=short"
+
+[tool.coverage.run]
+source = ["."]
+omit = ["tests/*", "cli.py"]
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true

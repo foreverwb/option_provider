@@ -1,7 +1,9 @@
 """
-HTTP client for the volatility_analysis Bridge API.
+HTTP client for the Bridge API.
 Provides both synchronous (BridgeClient) and asynchronous (AsyncBridgeClient) interfaces.
-Targets endpoints on http://<host>:8668.
+Targets endpoints on the configured bridge service URL.
+
+v2.0: Enhanced get_snapshot/get_batch with date, source, and filtering params.
 """
 
 from __future__ import annotations
@@ -36,7 +38,6 @@ class BridgeClient:
         if headers:
             self._session.headers.update(headers)
 
-    # --- Context manager ---
     def __enter__(self) -> "BridgeClient":
         return self
 
@@ -47,17 +48,40 @@ class BridgeClient:
         self._session.close()
 
     # --- Endpoints ---
-    def get_snapshot(self, symbol: str) -> BridgeSnapshot:
+
+    def get_snapshot(
+        self,
+        symbol: str,
+        date: Optional[str] = None,
+        source: Optional[str] = None,
+    ) -> BridgeSnapshot:
         """GET /api/bridge/params/<symbol>"""
         url = f"{self.base_url}/api/bridge/params/{symbol.upper()}"
-        resp = self._session.get(url, timeout=self.timeout)
+        params: Dict[str, Any] = {}
+        if date:
+            params["date"] = date
+        if source:
+            params["source"] = source
+        resp = self._session.get(url, params=params, timeout=self.timeout)
         resp.raise_for_status()
-        return BridgeSnapshot.from_dict(resp.json())
+        data = resp.json()
+
+        # Handle VA-style wrapped response
+        if isinstance(data, dict):
+            if data.get("success") is True and isinstance(data.get("bridge"), dict):
+                return BridgeSnapshot.from_dict(data["bridge"])
+            if data.get("bridge") is not None:
+                return BridgeSnapshot.from_dict(data["bridge"])
+        return BridgeSnapshot.from_dict(data)
 
     def get_batch(
         self,
         symbols: Optional[List[str]] = None,
         source: Optional[str] = None,
+        date: Optional[str] = None,
+        min_direction_score: Optional[float] = None,
+        min_vol_score: Optional[float] = None,
+        limit: Optional[int] = None,
         filtering: Optional[Dict[str, Any]] = None,
         sorting: Optional[Dict[str, Any]] = None,
     ) -> List[BridgeSnapshot]:
@@ -68,15 +92,32 @@ class BridgeClient:
             payload["symbols"] = [s.upper() for s in symbols]
         if source:
             payload["source"] = source
+        if date:
+            payload["date"] = date
+        if min_direction_score is not None:
+            payload["min_direction_score"] = min_direction_score
+        if min_vol_score is not None:
+            payload["min_vol_score"] = min_vol_score
+        if limit is not None:
+            payload["limit"] = limit
         if filtering:
             payload["filtering"] = filtering
         if sorting:
             payload["sorting"] = sorting
+
         resp = self._session.post(url, json=payload, timeout=self.timeout)
         resp.raise_for_status()
         data = resp.json()
-        items = data if isinstance(data, list) else data.get("results", data.get("snapshots", []))
-        return [BridgeSnapshot.from_dict(item) for item in items]
+
+        # Handle various response formats
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            items = data.get("results", data.get("snapshots", []))
+        else:
+            items = []
+
+        return [BridgeSnapshot.from_dict(item) for item in items if isinstance(item, dict)]
 
     def get_records(self, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """GET /api/records"""
@@ -135,15 +176,37 @@ class AsyncBridgeClient:
     async def close(self) -> None:
         await self._client.aclose()
 
-    async def get_snapshot(self, symbol: str) -> BridgeSnapshot:
-        resp = await self._client.get(f"/api/bridge/params/{symbol.upper()}")
+    async def get_snapshot(
+        self,
+        symbol: str,
+        date: Optional[str] = None,
+        source: Optional[str] = None,
+    ) -> BridgeSnapshot:
+        params: Dict[str, Any] = {}
+        if date:
+            params["date"] = date
+        if source:
+            params["source"] = source
+        resp = await self._client.get(
+            f"/api/bridge/params/{symbol.upper()}", params=params
+        )
         resp.raise_for_status()
-        return BridgeSnapshot.from_dict(resp.json())
+        data = resp.json()
+        if isinstance(data, dict):
+            if data.get("success") is True and isinstance(data.get("bridge"), dict):
+                return BridgeSnapshot.from_dict(data["bridge"])
+            if data.get("bridge") is not None:
+                return BridgeSnapshot.from_dict(data["bridge"])
+        return BridgeSnapshot.from_dict(data)
 
     async def get_batch(
         self,
         symbols: Optional[List[str]] = None,
         source: Optional[str] = None,
+        date: Optional[str] = None,
+        min_direction_score: Optional[float] = None,
+        min_vol_score: Optional[float] = None,
+        limit: Optional[int] = None,
         filtering: Optional[Dict[str, Any]] = None,
         sorting: Optional[Dict[str, Any]] = None,
     ) -> List[BridgeSnapshot]:
@@ -152,15 +215,29 @@ class AsyncBridgeClient:
             payload["symbols"] = [s.upper() for s in symbols]
         if source:
             payload["source"] = source
+        if date:
+            payload["date"] = date
+        if min_direction_score is not None:
+            payload["min_direction_score"] = min_direction_score
+        if min_vol_score is not None:
+            payload["min_vol_score"] = min_vol_score
+        if limit is not None:
+            payload["limit"] = limit
         if filtering:
             payload["filtering"] = filtering
         if sorting:
             payload["sorting"] = sorting
+
         resp = await self._client.post("/api/bridge/batch", json=payload)
         resp.raise_for_status()
         data = resp.json()
-        items = data if isinstance(data, list) else data.get("results", data.get("snapshots", []))
-        return [BridgeSnapshot.from_dict(item) for item in items]
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            items = data.get("results", data.get("snapshots", []))
+        else:
+            items = []
+        return [BridgeSnapshot.from_dict(item) for item in items if isinstance(item, dict)]
 
     async def get_records(self, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         resp = await self._client.get("/api/records", params=params)

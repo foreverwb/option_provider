@@ -2,6 +2,8 @@
 Decoupled data models for Bridge snapshots.
 Mirrors volatility_analysis/bridge/spec.py field-for-field.
 Zero dependency on core modules — safe to use in external services.
+
+v2.0: Added ExecutionState with confidence / liquidity / oi fields.
 """
 
 from __future__ import annotations
@@ -24,9 +26,11 @@ class TermStructureSnapshot:
     contango: bool = True
     raw_ratios: Dict[str, float] = field(default_factory=dict)
 
-    # ------------------------------------------------------------------
-    # Serialisation helpers
-    # ------------------------------------------------------------------
+    # Extended fields from VA bridge spec
+    label: Optional[str] = None
+    ratio_30_90: Optional[float] = None
+    state_flags: Dict[str, bool] = field(default_factory=dict)
+
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
@@ -47,10 +51,96 @@ class TermStructureSnapshot:
 
 
 @dataclass
+class ExecutionState:
+    """
+    Execution-state block from bridge snapshot.
+    Contains confidence, liquidity, OI availability, and posture fields
+    consumed by downstream workflows (swing / vol_quant).
+    """
+
+    quadrant: Optional[str] = None
+    direction_score: Optional[float] = None
+    vol_score: Optional[float] = None
+    direction_bias: Optional[str] = None
+    vol_bias: Optional[str] = None
+
+    # Key fields consumed by vol_quant_workflow & swing_workflow
+    confidence: Optional[float] = None
+    confidence_notes: Optional[str] = None
+    liquidity: Optional[str] = None
+    active_open_ratio: Optional[float] = None
+    oi_data_available: Optional[bool] = None
+
+    # Data quality
+    data_quality: Optional[str] = None
+    data_quality_issues: Optional[str] = None
+
+    # Flow / permission
+    penalized_extreme_move_low_vol: Optional[bool] = None
+    flow_bias: Optional[float] = None
+    trade_permission: Optional[str] = None
+    permission_reasons: Optional[List[str]] = None
+    disabled_structures: Optional[List[str]] = None
+    watch_triggers: Optional[List[str]] = None
+    what_to_monitor: Optional[str] = None
+
+    # Posture fields
+    posture_5d: Optional[str] = None
+    posture_reasons: Optional[List[str]] = None
+    posture_reason_codes: Optional[List[str]] = None
+    posture_confidence: Optional[float] = None
+    posture_inputs_snapshot: Optional[Dict[str, Any]] = None
+    posture_overlay_notes: Optional[str] = None
+
+    # Trend fields
+    dir_slope_nd: Optional[float] = None
+    dir_trend_label: Optional[str] = None
+    trend_days_used: Optional[int] = None
+
+    # Fear regime
+    fear_regime: Optional[str] = None
+    fear_reasons: Optional[List[str]] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ExecutionState":
+        if data is None:
+            return cls()
+        known = {f.name for f in cls.__dataclass_fields__.values()}
+        filtered = {k: v for k, v in data.items() if k in known}
+        return cls(**filtered)
+
+
+@dataclass
+class EventState:
+    """Event-state block (earnings, squeeze, index flags)."""
+
+    earnings_date: Optional[str] = None
+    days_to_earnings: Optional[int] = None
+    is_earnings_window: bool = False
+    is_index: bool = False
+    is_squeeze: bool = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "EventState":
+        if data is None:
+            return cls()
+        known = {f.name for f in cls.__dataclass_fields__.values()}
+        filtered = {k: v for k, v in data.items() if k in known}
+        return cls(**filtered)
+
+
+@dataclass
 class BridgeSnapshot:
     """
     Complete bridge snapshot for a single symbol.
-    Mirrors all fields from volatility_analysis/bridge/spec.py.
+    v2.0: Added structured execution_state / event_state / market_state
+    while maintaining backward-compatible flat fields.
     """
 
     # --- Identity ---
@@ -80,8 +170,10 @@ class BridgeSnapshot:
     # --- Term structure ---
     term_structure: Optional[TermStructureSnapshot] = None
 
-    # --- Market state (flat fields for backward compat) ---
+    # --- Structured sub-states (v2.0) ---
     market_state: Dict[str, Any] = field(default_factory=dict)
+    event_state: Optional[EventState] = None
+    execution_state: Optional[ExecutionState] = None
 
     # --- Earnings ---
     earnings_date: Optional[str] = None
@@ -95,6 +187,7 @@ class BridgeSnapshot:
 
     # --- Source metadata ---
     source: str = ""
+    as_of: Optional[str] = None
     data_quality: str = "OK"
     warnings: List[str] = field(default_factory=list)
 
@@ -116,6 +209,10 @@ class BridgeSnapshot:
                 continue
             if k == "term_structure" and isinstance(v, dict):
                 filtered[k] = TermStructureSnapshot.from_dict(v)
+            elif k == "execution_state" and isinstance(v, dict):
+                filtered[k] = ExecutionState.from_dict(v)
+            elif k == "event_state" and isinstance(v, dict):
+                filtered[k] = EventState.from_dict(v)
             else:
                 filtered[k] = v
         return cls(**filtered)

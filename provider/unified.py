@@ -1,6 +1,7 @@
 """
 UnifiedProvider — single entry point that combines bridge_client + orats_provider.
 
+v2.0: Enhanced bridge methods supporting date/source/filtering params.
 full_analysis() is fault-tolerant: any sub-query failure does not block others.
 Supports context manager protocol.
 """
@@ -42,11 +43,38 @@ class UnifiedProvider:
 
     # ── Bridge delegates ────────────────────────────────────────────
 
-    def get_bridge_snapshot(self, symbol: str) -> BridgeSnapshot:
-        return self._bridge.get_snapshot(symbol)
+    def get_bridge_snapshot(
+        self,
+        symbol: str,
+        date: Optional[str] = None,
+        source: Optional[str] = None,
+    ) -> BridgeSnapshot:
+        """Fetch a single bridge snapshot, optionally filtered by date/source."""
+        return self._bridge.get_snapshot(symbol, date=date, source=source)
 
-    def get_bridge_batch(self, symbols: List[str], **kwargs: Any) -> List[BridgeSnapshot]:
-        return self._bridge.get_batch(symbols, **kwargs)
+    def get_bridge_batch(
+        self,
+        symbols: Optional[List[str]] = None,
+        source: Optional[str] = None,
+        date: Optional[str] = None,
+        min_direction_score: Optional[float] = None,
+        min_vol_score: Optional[float] = None,
+        limit: Optional[int] = None,
+        filtering: Optional[Dict[str, Any]] = None,
+        sorting: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> List[BridgeSnapshot]:
+        """Fetch batch bridge snapshots with full filtering support."""
+        return self._bridge.get_batch(
+            symbols=symbols,
+            source=source,
+            date=date,
+            min_direction_score=min_direction_score,
+            min_vol_score=min_vol_score,
+            limit=limit,
+            filtering=filtering,
+            sorting=sorting,
+        )
 
     def get_micro_template(self, symbol: str) -> Dict[str, Any]:
         snap = self._bridge.get_snapshot(symbol)
@@ -74,11 +102,6 @@ class UnifiedProvider:
         vol_commands_list: Optional[List[str]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        """
-        Run a comprehensive analysis for a symbol.
-        Each sub-query is independently wrapped — a failure in one
-        does not block the others.
-        """
         if greeks_commands_list is None:
             greeks_commands_list = ["gex", "dex", "vex", "vanna"]
         if vol_commands_list is None:
@@ -93,7 +116,6 @@ class UnifiedProvider:
             "errors": [],
         }
 
-        # Bridge snapshot
         try:
             snap = self._bridge.get_snapshot(symbol)
             result["bridge"] = snap.to_dict()
@@ -101,7 +123,6 @@ class UnifiedProvider:
         except Exception as e:
             result["errors"].append({"source": "bridge", "error": str(e)})
 
-        # Greeks
         for cmd in greeks_commands_list:
             try:
                 r = greeks_commands.execute(self._orats, symbol, cmd, **kwargs)
@@ -109,7 +130,6 @@ class UnifiedProvider:
             except Exception as e:
                 result["errors"].append({"source": f"greeks.{cmd}", "error": str(e)})
 
-        # Volatility
         for cmd in vol_commands_list:
             try:
                 r = vol_commands.execute(self._orats, symbol, cmd, **kwargs)

@@ -1,43 +1,41 @@
 """
 Bridge routes — /api/v1/bridge/*
 
-v2.0: Enhanced routes with full bridge batch, params endpoints.
-Supports execution_state.confidence, liquidity, oi_data_available fields.
-Proxy-compatible with volatility_analysis API surface.
+v2.1: Batch route is now dispatcher-driven.
+/snapshot and /params are deprecated compatibility routes.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException, Query, Response
 
 from api.dependencies import get_provider
+from bridge_middleware.contracts import BatchRequest
+from bridge_middleware.dispatcher import dispatch_by_source
 
 router = APIRouter(prefix="/api/v1/bridge", tags=["bridge"])
 
-
-class BatchRequest(BaseModel):
-    symbols: Optional[List[str]] = None
-    source: Optional[str] = "swing"
-    date: Optional[str] = None
-    min_direction_score: Optional[float] = None
-    min_vol_score: Optional[float] = None
-    limit: Optional[int] = None
-    filtering: Optional[Dict[str, Any]] = None
-    sorting: Optional[Dict[str, Any]] = None
-    vix_override: Optional[float] = None
+_DEPRECATED_HINT = "Deprecated endpoint. Use POST /api/bridge/batch."
 
 
-@router.get("/snapshot/{symbol}")
+def _set_deprecated_headers(response: Response) -> None:
+    response.headers["Warning"] = f'299 - "{_DEPRECATED_HINT}"'
+    response.headers["X-API-Deprecated"] = "true"
+    response.headers["X-API-Alternative"] = "/api/bridge/batch"
+
+
+@router.get("/snapshot/{symbol}", deprecated=True)
 async def get_snapshot(
+    response: Response,
     symbol: str,
     date: Optional[str] = Query(None),
     source: Optional[str] = Query(None),
 ) -> Dict[str, Any]:
-    """Get bridge snapshot for a single symbol."""
+    """Deprecated: use POST /api/bridge/batch with symbols=[symbol]."""
     try:
+        _set_deprecated_headers(response)
         provider = get_provider()
         snap = provider.get_bridge_snapshot(symbol, date=date, source=source)
         return snap.to_dict() if hasattr(snap, "to_dict") else snap
@@ -45,35 +43,30 @@ async def get_snapshot(
         raise HTTPException(status_code=502, detail=str(e))
 
 
-@router.post("/batch")
+@router.post(
+    "/batch",
+    deprecated=True,
+    summary="Deprecated v1 batch route",
+    description="Deprecated v1 route. Use POST /api/bridge/batch as the official downstream entrypoint.",
+)
 async def get_batch(req: BatchRequest) -> Dict[str, Any]:
     """
-    Batch bridge snapshots with filtering.
-    Compatible with volatility_analysis /api/bridge/batch response format.
+    Dispatcher-backed batch endpoint.
+    NOTE: this /api/v1/bridge/batch path is deprecated; /api/bridge/batch is the official entrypoint.
     """
     try:
         provider = get_provider()
-        result = provider.get_bridge_batch(
-            symbols=req.symbols,
-            source=req.source,
-            date=req.date,
-            min_direction_score=req.min_direction_score,
-            min_vol_score=req.min_vol_score,
-            limit=req.limit,
-            filtering=req.filtering,
-            sorting=req.sorting,
-        )
-        # Return VA-compatible response
-        if isinstance(result, list):
-            snapshots = [s.to_dict() if hasattr(s, "to_dict") else s for s in result]
-            return {
-                "success": True,
-                "date": req.date,
-                "source": req.source or "swing",
-                "count": len(snapshots),
-                "results": snapshots,
-            }
-        return result
+        bridge_client = getattr(provider, "_bridge", None)
+        if bridge_client is None or not hasattr(bridge_client, "get_records"):
+            raise RuntimeError("Bridge record client unavailable")
+
+        # Keep records retrieval broad so dispatcher can apply date fallback correctly.
+        records = bridge_client.get_records()
+        if not isinstance(records, list):
+            raise RuntimeError("Bridge records payload is not a list")
+
+        result = dispatch_by_source(req, records)
+        return result.model_dump()
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
 
@@ -82,17 +75,18 @@ async def get_batch(req: BatchRequest) -> Dict[str, Any]:
 # These routes mirror the volatility_analysis API paths so that swing and
 # vol_quant workflows can seamlessly switch their provider URL.
 
-@router.get("/params/{symbol}")
+@router.get("/params/{symbol}", deprecated=True)
 async def get_bridge_params(
+    response: Response,
     symbol: str,
     date: Optional[str] = Query(None),
     source: Optional[str] = Query(None),
 ) -> Dict[str, Any]:
     """
-    VA-compatible: GET /api/v1/bridge/params/{symbol}
-    Returns bridge snapshot in the same format as VA's /api/bridge/params/<symbol>.
+    Deprecated: use POST /api/bridge/batch with symbols=[symbol].
     """
     try:
+        _set_deprecated_headers(response)
         provider = get_provider()
         snap = provider.get_bridge_snapshot(symbol, date=date, source=source)
         bridge_dict = snap.to_dict() if hasattr(snap, "to_dict") else snap

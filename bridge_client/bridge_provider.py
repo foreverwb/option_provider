@@ -19,8 +19,12 @@ from .models import BridgeSnapshot, ExecutionState, EventState
 
 # ── Constants (migrated from core/api_constants.py) ─────────────────────
 BRIDGE_BATCH_DEFAULT_LIMIT = 50
-BRIDGE_BATCH_MIN_DIRECTION_SCORE = 1.0
-BRIDGE_BATCH_MIN_VOL_SCORE = 0.8
+# Keep aligned with VA's decision gate:
+# direction_pref_threshold(0.50) + neutral_buffer(0.05) = 0.55.
+BRIDGE_BATCH_MIN_DIRECTION_SCORE = 0.55
+# Keep aligned with VA vol decision gate:
+# vol_pref_threshold(0.07) + max(0.07*0.25, 0.05) = 0.12.
+BRIDGE_BATCH_MIN_VOL_SCORE = 0.12
 
 
 # ── Utility helpers ─────────────────────────────────────────────────────

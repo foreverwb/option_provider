@@ -18,7 +18,7 @@ from http import HTTPStatus
 from typing import Any, Dict, List, Optional
 
 import fastapi
-from fastapi import FastAPI, HTTPException, Query, APIRouter, Request
+from fastapi import FastAPI, HTTPException, Query, APIRouter, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from orats_provider import OratsConfig
@@ -95,7 +95,12 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Options Provider API",
     version="1.0.0",
-    description="Unified options analysis: Bridge + ORATS Greeks + Volatility",
+    description=(
+        "Unified options analysis: Bridge + ORATS Greeks + Volatility.\n\n"
+        "Downstream bridge consumers must use POST /api/bridge/batch as the only "
+        "official integration entrypoint. Compatibility routes "
+        "(/api/bridge/params/{symbol}, /api/v1/bridge/*) are deprecated."
+    ),
     lifespan=lifespan,
 )
 
@@ -162,11 +167,16 @@ from api.routes.bridge import router as _bridge_compat
 _compat_router = APIRouter(prefix="/api/bridge", tags=["bridge-compat"])
 
 
-@_compat_router.get("/params/{symbol}")
-async def compat_bridge_params(symbol: str, date: str = None, source: str = None):
-    """VA-compatible: GET /api/bridge/params/{symbol}"""
+@_compat_router.get("/params/{symbol}", deprecated=True)
+async def compat_bridge_params(
+    response: Response,
+    symbol: str,
+    date: str = None,
+    source: str = None,
+):
+    """Deprecated compatibility endpoint. Use POST /api/bridge/batch."""
     from api.routes.bridge import get_bridge_params
-    return await get_bridge_params(symbol, date=date, source=source)
+    return await get_bridge_params(response=response, symbol=symbol, date=date, source=source)
 
 
 @_compat_router.post("/batch")
@@ -174,7 +184,7 @@ async def compat_bridge_batch(
     source: Optional[str] = Query(None),
     req: dict = fastapi.Body(default={}),
 ):
-    """VA-compatible: POST /api/bridge/batch"""
+    """Official downstream bridge entrypoint."""
     from api.routes.bridge import BatchRequest, get_batch
     from pydantic import ValidationError
     payload = dict(req or {})
@@ -190,8 +200,8 @@ async def compat_bridge_batch(
 
     try:
         batch_req = BatchRequest(**payload)
-    except (ValidationError, TypeError):
-        batch_req = BatchRequest(source=query_source or "swing")
+    except (ValidationError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid batch request payload: {exc}") from exc
     return await get_batch(batch_req)
 
 

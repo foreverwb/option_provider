@@ -4,13 +4,24 @@ from __future__ import annotations
 
 from typing import Any, Iterable
 
-from bridge_client.bridge_provider import safe_float
+from .bridge_builder import safe_float
 
 from .adapters.swing import to_swing_row
 from .adapters.vol import to_vol_row
+from .boundary_engine import compute_micro_boundary, load_boundary_rules
 from .contracts import BatchError, BatchRequest, BatchResponse
 
 _VALID_SOURCES = {"swing", "vol"}
+
+# Module-level rule cache (loaded once).
+_boundary_rules: dict[str, Any] | None = None
+
+
+def _get_boundary_rules() -> dict[str, Any]:
+    global _boundary_rules
+    if _boundary_rules is None:
+        _boundary_rules = load_boundary_rules()
+    return _boundary_rules
 
 
 def _record_date(record: dict[str, Any]) -> str | None:
@@ -181,12 +192,31 @@ def dispatch_by_source(req: BatchRequest, records: list[dict[str, Any]]) -> Batc
     filtered_records = [r for r in selected_records if _filter_for_source(req, r)]
 
     rows: list[dict[str, Any]] = []
+    boundary_rules = _get_boundary_rules()
     for record in filtered_records:
         try:
             if source == "swing":
-                rows.append(to_swing_row(record, req))
+                row = to_swing_row(record, req)
             else:
-                rows.append(to_vol_row(record))
+                row = to_vol_row(record)
+
+            # ★ Compute micro_boundary and attach to the row.
+            bridge_payload = row.get("bridge", {})
+            try:
+                mb = compute_micro_boundary(bridge_payload, rules=boundary_rules)
+                row["micro_boundary"] = mb.to_dict()
+            except Exception as exc:
+                # Boundary failure must never drop the row.
+                row["micro_boundary"] = None
+                errors.append(
+                    BatchError(
+                        code="BOUNDARY_COMPUTE_FAILED",
+                        symbol=_record_symbol(record) or None,
+                        message=str(exc),
+                    )
+                )
+
+            rows.append(row)
         except Exception as exc:
             symbol = _record_symbol(record) or None
             errors.append(

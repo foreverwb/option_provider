@@ -25,7 +25,7 @@ _green   := \033[92m
 _reset   := \033[0m
 
 .PHONY: help serve dev test test-greeks test-vol test-models test-client \
-        test-cov health routes install clean lint fmt
+        test-boundary test-cov health routes install clean lint fmt
 
 # ── Default target ──────────────────────────────────────────────────────
 help:  ## Show this help
@@ -60,6 +60,9 @@ test-models:  ## Run model/serialization tests
 
 test-client:  ## Run client/cache tests
 	@PYTHONPATH=. $(PYTHON) -m pytest tests/test_client.py -v
+
+test-boundary:  ## Run boundary engine + micro boundary tests
+	@PYTHONPATH=. $(PYTHON) -m pytest tests/test_boundary_engine.py tests/test_micro_boundary.py -v
 
 test-cov:  ## Run tests with coverage report
 	@PYTHONPATH=. $(PYTHON) -m pytest tests/ -v --cov=. --cov-report=term-missing --tb=short

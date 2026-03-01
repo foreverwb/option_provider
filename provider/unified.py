@@ -1,5 +1,5 @@
 """
-UnifiedProvider — single entry point that combines bridge_client + orats_provider.
+UnifiedProvider — single entry point that combines bridge_provider + orats_provider.
 
 v2.0: Enhanced bridge methods supporting date/source/filtering params.
 full_analysis() is fault-tolerant: any sub-query failure does not block others.
@@ -11,7 +11,7 @@ from __future__ import annotations
 import traceback
 from typing import Any, Dict, List, Optional
 
-from bridge_client import BridgeClient, BridgeSnapshot, select_micro_template
+from bridge_provider import BridgeClient, BridgeSnapshot, select_micro_template
 from orats_provider import OratsClient, OratsConfig
 from orats_provider.greeks_exposure import commands as greeks_commands
 from orats_provider.volatility import commands as vol_commands

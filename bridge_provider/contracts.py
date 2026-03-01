@@ -92,6 +92,7 @@ class SwingBatchRow(BaseModel):
     symbol: str
     market_params: SwingMarketParams
     bridge: dict[str, Any]
+    micro_boundary: dict[str, Any] | None = None   # v3.0: centralized boundary payload
 
 
 class VolBatchRow(BaseModel):
@@ -101,6 +102,7 @@ class VolBatchRow(BaseModel):
 
     symbol: str
     bridge: dict[str, Any]
+    micro_boundary: dict[str, Any] | None = None   # v3.0: centralized boundary payload
 
 
 class BatchError(BaseModel):

@@ -1,0 +1,145 @@
+# ===========================================================================
+# boundary_rules.yaml — 中心化 micro boundary 规则
+# ===========================================================================
+# 版本: 1.0
+# 来源: 从 vol_quant_workflow/config/bridge_rules_gexbot.yaml 提升
+# 用途: bridge middleware 在构建 MicroBoundary 时读取此文件
+# ===========================================================================
+
+version: "1.0"
+
+
+# === 流动性 → strikes 映射 ===
+liquidity:
+  strikes_map:
+    excellent: 21
+    good: 17
+    fair: 13
+    poor: 9
+  default_strikes: 15
+  # poor 流动性时禁止买波策略（blocked）
+  poor_blocks_long_vol: true
+
+
+# === OI 可用性 ===
+oi:
+  unavailable_max_strikes: 11
+
+
+# === 置信度门控 ===
+# 买波（long vol）与卖波（short vol）采用不同阈值
+confidence:
+  buy_vol_min: 0.35              # 买波门控
+  sell_vol_min: 0.50             # 卖波门控（更严格）
+  blocked_threshold: 0.20        # 低于此值 → context = "blocked"
+  missing_default: 0.50          # 置信度缺失时的默认值
+  low_context: "minimum"         # 通过 gate 但低置信度 → "minimum" context
+  blocked_context: "blocked"     # 未通过 gate → "blocked" context
+
+  # meso_state 维度差异化配置
+  meso_overrides:
+    偏多-买波:
+      min: 0.35
+    偏多-卖波:
+      min: 0.50
+    偏空-买波:
+      min: 0.35
+    偏空-卖波:
+      min: 0.50
+
+
+# === 财报窗口 ===
+earnings:
+  enabled: true
+  window_days: 14                # 距财报 ≤14 天视为 earnings window
+  event_context: "event"         # 财报窗口内 context 覆写
+  imminent_days: 3               # 距财报 ≤3 天视为 imminent
+  imminent_max_dte: 21           # imminent 时最大 DTE
+  tighten:
+    dte_extrinsic_ntm: 30
+    dte_theta_atm: 14
+    dte_gex_scale: 0.85
+
+
+# === 期限结构 ===
+term_structure:
+  horizon_multipliers:
+    adjustment_weight: 1.0
+    bias_weight: 1.0
+    weights:
+      gex: 1.0
+      skew: 0.8
+      vex: 1.0
+      term: 1.0
+
+    # 根据 term structure regime 覆写各维度 scale
+    state_overrides:
+      short_low:
+        gex_scale: 0.85
+        skew_scale: 0.90
+        trigger_scale: 0.85
+      full_inversion:
+        gex_scale: 0.70
+        skew_scale: 0.80
+        vex_scale: 0.85
+        term_scale: 0.85
+      short_inversion:
+        gex_scale: 0.80
+        skew_scale: 0.90
+        vex_scale: 0.95
+        term_scale: 0.95
+      far_elevated:
+        gex_scale: 1.00
+        skew_scale: 1.00
+        vex_scale: 1.15
+        term_scale: 1.15
+
+
+# === 参数 Clamp ===
+clamps:
+  strikes:
+    min: 7
+    max: 31
+  dte_short:
+    min: 7
+    max: 120
+  dte_mid:
+    min: 14
+    max: 180
+  dte_long:
+    min: 30
+    max: 365
+  dte_term:
+    min: 60
+    max: 730
+
+
+# === 数据质量 ===
+data_quality:
+  poor_confidence_penalty: 0.80  # data_quality == "poor" → confidence *= 0.8
+
+
+# === 降级规则 ===
+degradation:
+  # 从最严重到最宽松排序；取最严重命中项
+  mode_priority:
+    - "blocked"                  # 关键字段全缺或置信度极低
+    - "fallback"                 # 多个关键字段缺失，使用回退默认值
+    - "partial"                  # 少量字段缺失，boundary 仍可用
+    - "full"                     # 数据完整
+
+  # 每种 mode 的触发条件
+  rules:
+    blocked:
+      conditions:
+        - "confidence < blocked_threshold"
+        - "liquidity == 'poor' AND vol_bias == '买波'"
+    fallback:
+      conditions:
+        - "missing_fields >= 3"
+    partial:
+      conditions:
+        - "missing_fields >= 1"
+    full:
+      conditions:
+        - "default"

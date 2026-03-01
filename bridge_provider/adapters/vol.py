@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from bridge_client.bridge_provider import parse_earnings_date_to_iso, parse_term_structure_ratio, safe_float
+from ..bridge_builder import parse_earnings_date_to_iso, parse_term_structure_ratio, safe_float
 
 
 def _symbol_from_record(record: dict[str, Any]) -> str:

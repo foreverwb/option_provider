@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from bridge_client.bridge_provider import parse_term_structure_ratio, safe_float
+from ..bridge_builder import parse_term_structure_ratio, safe_float
 
 from .vol import build_bridge_payload
 
